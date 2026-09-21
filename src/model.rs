@@ -347,6 +347,34 @@ impl Store {
             .count()
     }
 
+    /// When the task last moved: the remote item's update time, or the
+    /// task's own for manual ones.
+    pub fn last_activity(t: &Task) -> DateTime<Utc> {
+        match &t.origin {
+            Origin::Remote(r) => r.remote_updated_at,
+            Origin::Manual => t.updated_at,
+        }
+    }
+
+    /// Unarchived, unpinned tasks with no activity since `cutoff`.
+    pub fn stale_ids(&self, cutoff: DateTime<Utc>) -> Vec<String> {
+        self.data
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.state != TaskState::Archived && !t.pinned && Self::last_activity(t) < cutoff
+            })
+            .map(|t| t.id.clone())
+            .collect()
+    }
+
+    /// Archive each id. Returns how many changed.
+    pub fn archive_many(&mut self, ids: &[String]) -> usize {
+        ids.iter()
+            .filter(|id| self.archive(id).unwrap_or(false))
+            .count()
+    }
+
     /// Newest task in `project` that is not archived, other than `exclude`.
     pub fn newest_unarchived_in_project(&self, project: &str, exclude: &str) -> Option<String> {
         self.data
@@ -962,6 +990,33 @@ mod tests {
         assert!(s.apply_remote(&[dropped(1, t0())]).is_empty());
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
         assert!(s.get(&id).unwrap().pinned);
+    }
+
+    #[test]
+    fn stale_tasks_are_the_unpinned_ones_without_recent_activity() {
+        let mut s = Store::in_memory();
+        let now = Utc::now();
+        let cutoff = now - Duration::days(365);
+        let old = now - Duration::days(400);
+        s.apply_remote(&[
+            remote(1, RemoteState::Open, old),
+            remote(2, RemoteState::Open, now - Duration::days(1)),
+            remote(3, RemoteState::Open, old),
+            remote(4, RemoteState::Open, old),
+        ]);
+        let ids: Vec<String> = s.tasks().iter().map(|t| t.id.clone()).collect();
+        s.set_pinned(&ids[2], true).unwrap();
+        s.archive(&ids[3]).unwrap();
+        let fresh_manual = s.add_manual("today", "", None);
+        let stale = s.stale_ids(cutoff);
+        assert_eq!(stale, vec![ids[0].clone()]);
+        assert_eq!(s.archive_many(&stale), 1);
+        assert_eq!(s.get(&ids[0]).unwrap().rung(), Rung::Archived);
+        assert_eq!(s.get(&ids[1]).unwrap().rung(), Rung::Active);
+        assert!(s.get(&ids[2]).unwrap().pinned);
+        assert_eq!(s.get(&fresh_manual).unwrap().rung(), Rung::Active);
+        // Archiving the same set again changes nothing.
+        assert_eq!(s.archive_many(&stale), 0);
     }
 
     #[test]

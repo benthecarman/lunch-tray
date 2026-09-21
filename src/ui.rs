@@ -79,6 +79,8 @@ enum Modal {
         manual: bool,
         focused: bool,
     },
+    /// Archive every task with no activity for a year.
+    ConfirmArchiveStale { ids: Vec<String>, fresh: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -691,6 +693,21 @@ impl App {
             }
             ui.separator();
             if ui
+                .button(format!("{}  Archive older than a year", icons::ARCHIVE))
+                .clicked()
+            {
+                let cutoff = Utc::now() - chrono::Duration::days(365);
+                let mut s = self.shared.lock().unwrap();
+                let ids = s.store.stale_ids(cutoff);
+                if ids.is_empty() {
+                    s.push_notice(Notice::info("Nothing has been quiet for a year."));
+                } else {
+                    drop(s);
+                    self.modal = Some(Modal::ConfirmArchiveStale { ids, fresh: true });
+                }
+                ui.close();
+            }
+            if ui
                 .button(format!("{}  Open config file", icons::GEAR))
                 .clicked()
             {
@@ -989,6 +1006,68 @@ impl App {
                     });
                 }
             }
+            Modal::ConfirmArchiveStale { ids, fresh } => {
+                let mut confirmed = false;
+                let mut cancel = false;
+                let n = ids.len();
+                let label = if n == 1 {
+                    "Archive 1 task".to_string()
+                } else {
+                    format!("Archive {n} tasks")
+                };
+                let resp = egui::Modal::new(Id::new("confirm-archive-stale"))
+                    .frame(frame)
+                    .show(ctx, |ui| {
+                        ui.set_width(360.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icons::ARCHIVE).size(22.0).color(p.text));
+                            ui.label(
+                                RichText::new(format!("{label}?")).text_style(TextStyle::Heading),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.add(
+                            Label::new(
+                                "Everything with no activity for a year, except pinned tasks. \
+                                 They come back if something happens on them.",
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(14.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if primary_button(ui, icons::ARCHIVE, &label).clicked() {
+                                confirmed = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if !fresh && ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    confirmed = true;
+                }
+                if confirmed {
+                    let mut s = self.shared.lock().unwrap();
+                    let archived = s.store.archive_many(&ids);
+                    s.save_store();
+                    s.push_notice(Notice::info(if archived == 1 {
+                        "Archived 1 task".to_string()
+                    } else {
+                        format!("Archived {archived} tasks")
+                    }));
+                    drop(s);
+                    if let Some(sel) = self.selected.clone()
+                        && ids.contains(&sel)
+                    {
+                        let project = self.project_of(&sel);
+                        if let Some(project) = project {
+                            self.leave_project(&sel, &project);
+                        }
+                    }
+                } else if !cancel && !resp.should_close() {
+                    self.modal = Some(Modal::ConfirmArchiveStale { ids, fresh: false });
+                }
+            }
             Modal::EditTask {
                 id,
                 mut title,
@@ -1119,15 +1198,24 @@ fn section_header(
 }
 
 fn ago(t: DateTime<Utc>) -> String {
-    let secs = (Utc::now() - t).num_seconds().max(0);
+    ago_from(t, Utc::now())
+}
+
+fn ago_from(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    const DAY: i64 = 86_400;
+    let secs = (now - t).num_seconds().max(0);
     if secs < 60 {
         "just now".into()
     } else if secs < 3600 {
         format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
+    } else if secs < DAY {
         format!("{}h ago", secs / 3600)
+    } else if secs < 30 * DAY {
+        format!("{}d ago", secs / DAY)
+    } else if secs < 365 * DAY {
+        format!("{}mo ago", secs / (30 * DAY))
     } else {
-        format!("{}d ago", secs / 86_400)
+        format!("{}y ago", secs / (365 * DAY))
     }
 }
 
@@ -1385,4 +1473,22 @@ fn overflow_menu(ui: &mut egui::Ui, p: &Palette, t: &Task) -> (Option<MenuAction
             }
         });
     (chosen, inner.is_some() && chosen.is_none())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_dates_roll_up_to_months_and_years() {
+        let now = Utc::now();
+        let d = |days: i64| ago_from(now - chrono::Duration::days(days), now);
+        assert_eq!(d(0), "just now");
+        assert_eq!(d(3), "3d ago");
+        assert_eq!(d(29), "29d ago");
+        assert_eq!(d(45), "1mo ago");
+        assert_eq!(d(364), "12mo ago");
+        assert_eq!(d(365), "1y ago");
+        assert_eq!(d(1647), "4y ago");
+    }
 }
