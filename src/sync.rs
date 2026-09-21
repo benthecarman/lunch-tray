@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::config::{Config, ForgejoAccount, GithubAccount, is_excluded};
-use crate::model::{Provider, RemoteItem, RemoteKind, RemoteRef, RemoteState, SyncEvent};
+use crate::model::{OnClose, Provider, RemoteItem, RemoteKind, RemoteRef, RemoteState, SyncEvent};
 use crate::shared::{Notice, SharedRef};
 
 const USER_AGENT: &str = concat!("lunch-tray/", env!("CARGO_PKG_VERSION"));
@@ -577,10 +577,11 @@ pub fn run_loop(
     shared: SharedRef,
     rx: Receiver<SyncCmd>,
     interval: Duration,
+    on_close: OnClose,
 ) {
     let mut round = 0usize;
     loop {
-        sync_once(&forges, &shared, round);
+        sync_once(&forges, &shared, on_close, round);
         round = round.wrapping_add(1);
         match rx.recv_timeout(interval) {
             Ok(SyncCmd::Now) | Err(RecvTimeoutError::Timeout) => continue,
@@ -591,7 +592,7 @@ pub fn run_loop(
 
 /// `round` rotates which tracked items get an individual check when there
 /// are more than `MAX_INDIVIDUAL_CHECKS` of them.
-pub fn sync_once(forges: &[Box<dyn Forge>], shared: &SharedRef, round: usize) {
+pub fn sync_once(forges: &[Box<dyn Forge>], shared: &SharedRef, on_close: OnClose, round: usize) {
     if forges.is_empty() {
         return;
     }
@@ -602,7 +603,7 @@ pub fn sync_once(forges: &[Box<dyn Forge>], shared: &SharedRef, round: usize) {
     }
     let mut errors = Vec::new();
     for forge in forges {
-        if let Err(e) = sync_forge(forge.as_ref(), shared, round) {
+        if let Err(e) = sync_forge(forge.as_ref(), shared, on_close, round) {
             let msg = format!("{} {}: {e:#}", forge.provider().label(), forge.host());
             log::warn!("{msg}");
             errors.push(msg);
@@ -621,7 +622,12 @@ pub fn sync_once(forges: &[Box<dyn Forge>], shared: &SharedRef, round: usize) {
     s.notify();
 }
 
-fn sync_forge(forge: &dyn Forge, shared: &SharedRef, round: usize) -> Result<()> {
+fn sync_forge(
+    forge: &dyn Forge,
+    shared: &SharedRef,
+    on_close: OnClose,
+    round: usize,
+) -> Result<()> {
     let mut items = forge.fetch_open()?;
     let excluded = |r: &RemoteRef| is_excluded(forge.exclude(), &r.owner, &r.repo);
     items.retain(|i| !excluded(&i.r));
@@ -683,7 +689,7 @@ fn sync_forge(forge: &dyn Forge, shared: &SharedRef, round: usize) -> Result<()>
     for label in put_away {
         s.push_notice(Notice::info(format!("Excluded repository: {label}")));
     }
-    let events = s.store.apply_remote(&items);
+    let events = s.store.apply_remote(on_close, &items);
     if (!events.is_empty() || excluded_any)
         && let Err(e) = s.store.save()
     {

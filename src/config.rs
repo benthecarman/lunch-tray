@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::model::OnClose;
+
 pub const APP_ID: &str = "lunch-tray";
 
 pub fn config_dir() -> PathBuf {
@@ -31,6 +33,10 @@ const TEMPLATE: &str = r#"# Lunch Tray configuration.
 #
 # Seconds between remote syncs.
 poll_interval_secs = 120
+
+# Where a task goes when its pull request or issue is closed or merged:
+# "settle" keeps it in Settled, "archive" puts it straight in the archive.
+# on_close = "settle"
 
 # GitHub accounts. With no token, Lunch Tray runs `gh auth token`.
 [[github]]
@@ -65,6 +71,9 @@ poll_interval_secs = 120
 pub struct Config {
     #[serde(default = "default_poll")]
     pub poll_interval_secs: u64,
+    /// Where closed or merged items go: `settle` (default) or `archive`.
+    #[serde(default)]
+    pub on_close: OnClose,
     #[serde(default)]
     pub github: Vec<GithubAccount>,
     #[serde(default)]
@@ -75,6 +84,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             poll_interval_secs: default_poll(),
+            on_close: OnClose::Settle,
             github: vec![GithubAccount::default()],
             forgejo: Vec::new(),
         }
@@ -263,10 +273,13 @@ mod tests {
     fn template_parses_to_defaults() {
         let cfg: Config = toml::from_str(TEMPLATE).unwrap();
         assert_eq!(cfg.poll_interval_secs, 120);
+        assert_eq!(cfg.on_close, OnClose::Settle);
         assert_eq!(cfg.github.len(), 1);
         assert_eq!(cfg.github[0].host(), "github.com");
         assert_eq!(cfg.github[0].queries, default_github_queries());
         assert!(cfg.forgejo.is_empty());
+        let cfg: Config = toml::from_str("on_close = \"archive\"").unwrap();
+        assert_eq!(cfg.on_close, OnClose::Archive);
     }
 
     #[test]

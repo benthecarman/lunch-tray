@@ -67,6 +67,15 @@ pub enum RemoteState {
     Merged,
 }
 
+/// Where a task goes when its remote item is closed or merged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OnClose {
+    #[default]
+    Settle,
+    Archive,
+}
+
 /// A pull request or issue on a remote forge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteRef {
@@ -544,13 +553,14 @@ impl Store {
     /// Upsert remote items. Open items that are not tracked yet become new
     /// Active tasks. Tracked items follow their remote state:
     ///
-    /// * open -> closed or merged: an Active task settles on its own
+    /// * open -> closed or merged: an Active task settles, or archives when
+    ///   `on_close` says so on its own
     /// * closed -> open: a Settled or Archived task reopens at the top of Active
     /// * open with newer activity: a Settled or Archived task wakes into Active
     ///
     /// Archived tasks wake like settled ones, so archiving a stale open item
     /// puts it away only until something happens on it.
-    pub fn apply_remote(&mut self, items: &[RemoteItem]) -> Vec<SyncEvent> {
+    pub fn apply_remote(&mut self, on_close: OnClose, items: &[RemoteItem]) -> Vec<SyncEvent> {
         let mut events = Vec::new();
         let now = Utc::now();
         for item in items {
@@ -613,8 +623,14 @@ impl Store {
                     }
                 }
             } else if was_open && !is_open {
-                if t.state == TaskState::Active {
-                    t.state = TaskState::Settled;
+                let target = match on_close {
+                    OnClose::Settle => TaskState::Settled,
+                    OnClose::Archive => TaskState::Archived,
+                };
+                let moves = t.state == TaskState::Active
+                    || (on_close == OnClose::Archive && t.state == TaskState::Settled);
+                if moves {
+                    t.state = target;
                     t.pinned = false;
                     changed = true;
                 }
@@ -781,11 +797,14 @@ mod tests {
     #[test]
     fn every_section_sorts_by_last_activity() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[
-            remote(1, RemoteState::Open, t0() + Duration::hours(1)),
-            remote(2, RemoteState::Open, t0() + Duration::hours(3)),
-            remote(3, RemoteState::Open, t0() + Duration::hours(2)),
-        ]);
+        s.apply_remote(
+            OnClose::Settle,
+            &[
+                remote(1, RemoteState::Open, t0() + Duration::hours(1)),
+                remote(2, RemoteState::Open, t0() + Duration::hours(3)),
+                remote(3, RemoteState::Open, t0() + Duration::hours(2)),
+            ],
+        );
         let ids: Vec<String> = s.tasks().iter().map(|t| t.id.clone()).collect();
         let order = |s: &Store| -> Vec<String> {
             s.sections().active.iter().map(|t| t.id.clone()).collect()
@@ -801,7 +820,10 @@ mod tests {
             order(&s),
             vec![ids[1].clone(), ids[2].clone(), ids[0].clone()]
         );
-        s.apply_remote(&[remote(1, RemoteState::Open, t0() + Duration::hours(4))]);
+        s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Open, t0() + Duration::hours(4))],
+        );
         assert_eq!(
             order(&s),
             vec![ids[0].clone(), ids[1].clone(), ids[2].clone()]
@@ -816,35 +838,35 @@ mod tests {
     #[test]
     fn store_refuses_to_delete_an_open_remote_item() {
         let mut s = Store::in_memory();
-        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        let ev = s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         assert!(matches!(ev.as_slice(), [SyncEvent::New { .. }]));
         let id = s.tasks()[0].id.clone();
         assert!(s.delete(&id).is_err());
         assert_eq!(s.settle(&id), Ok(true));
         assert!(s.delete(&id).is_err());
-        s.apply_remote(&[remote(1, RemoteState::Merged, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Merged, t0())]);
         assert_eq!(s.delete(&id), Ok(true));
     }
 
     #[test]
     fn a_stale_open_item_can_be_archived_until_it_moves_again() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         assert_eq!(s.archive(&id), Ok(true));
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
         // No activity: stays archived, even after leaving the queries.
         let mut quiet = remote(1, RemoteState::Open, t0());
         quiet.r.in_queries = false;
-        assert!(s.apply_remote(&[quiet.clone()]).is_empty());
-        assert!(s.apply_remote(&[quiet]).is_empty());
+        assert!(s.apply_remote(OnClose::Settle, &[quiet.clone()]).is_empty());
+        assert!(s.apply_remote(OnClose::Settle, &[quiet]).is_empty());
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
         // Still cannot delete while open.
         assert!(s.delete(&id).is_err());
         // Someone pushes: it comes back to the top of Active.
         let mut pushed = remote(1, RemoteState::Open, t0() + Duration::minutes(1));
         pushed.r.in_queries = false;
-        let ev = s.apply_remote(&[pushed]);
+        let ev = s.apply_remote(OnClose::Settle, &[pushed]);
         assert!(matches!(ev.as_slice(), [SyncEvent::Woken { .. }]));
         let t = s.get(&id).unwrap();
         assert_eq!(t.rung(), Rung::Active);
@@ -854,13 +876,13 @@ mod tests {
     #[test]
     fn a_review_requested_again_wakes_an_archived_task() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         let mut out = remote(1, RemoteState::Open, t0());
         out.r.in_queries = false;
-        s.apply_remote(&[out]);
+        s.apply_remote(OnClose::Settle, &[out]);
         s.archive(&id).unwrap();
-        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        let ev = s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         assert!(matches!(ev.as_slice(), [SyncEvent::Requested { .. }]));
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
     }
@@ -868,10 +890,10 @@ mod tests {
     #[test]
     fn closed_remote_item_settles_an_active_task() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         s.set_pinned(&id, true).unwrap();
-        let ev = s.apply_remote(&[remote(1, RemoteState::Merged, t0())]);
+        let ev = s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Merged, t0())]);
         assert!(matches!(
             ev.as_slice(),
             [SyncEvent::Closed { merged: true, .. }]
@@ -884,24 +906,36 @@ mod tests {
     #[test]
     fn remote_activity_wakes_settled_and_archived_tasks() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         s.settle(&id).unwrap();
-        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0() + Duration::minutes(1))]);
+        let ev = s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Open, t0() + Duration::minutes(1))],
+        );
         assert!(matches!(ev.as_slice(), [SyncEvent::Woken { .. }]));
         let t = s.get(&id).unwrap();
         assert_eq!(t.rung(), Rung::Active);
 
         // Same timestamp: no wake.
         s.settle(&id).unwrap();
-        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0() + Duration::minutes(1))]);
+        let ev = s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Open, t0() + Duration::minutes(1))],
+        );
         assert!(ev.is_empty());
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
 
         // An archived task comes back when the item is reopened.
-        s.apply_remote(&[remote(1, RemoteState::Closed, t0() + Duration::minutes(2))]);
+        s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Closed, t0() + Duration::minutes(2))],
+        );
         s.archive(&id).unwrap();
-        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0() + Duration::minutes(3))]);
+        let ev = s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Open, t0() + Duration::minutes(3))],
+        );
         assert!(matches!(
             ev.as_slice(),
             [SyncEvent::ReopenedRemotely { .. }]
@@ -912,11 +946,14 @@ mod tests {
     #[test]
     fn remotely_reopened_item_becomes_active_again() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
-        s.apply_remote(&[remote(1, RemoteState::Closed, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Closed, t0())]);
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
-        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0() + Duration::minutes(1))]);
+        let ev = s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Open, t0() + Duration::minutes(1))],
+        );
         assert!(matches!(
             ev.as_slice(),
             [SyncEvent::ReopenedRemotely { .. }]
@@ -927,12 +964,15 @@ mod tests {
     #[test]
     fn remote_reopen_keeps_the_pin_of_a_task_reopened_by_hand() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
-        s.apply_remote(&[remote(1, RemoteState::Closed, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Closed, t0())]);
         s.reopen(&id).unwrap();
         s.set_pinned(&id, true).unwrap();
-        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0() + Duration::minutes(1))]);
+        let ev = s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Open, t0() + Duration::minutes(1))],
+        );
         assert!(matches!(
             ev.as_slice(),
             [SyncEvent::ReopenedRemotely { .. }]
@@ -946,16 +986,19 @@ mod tests {
     #[test]
     fn unseen_only_counts_active_tasks_and_clears_on_settle() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[
-            remote(1, RemoteState::Open, t0()),
-            remote(2, RemoteState::Open, t0()),
-        ]);
+        s.apply_remote(
+            OnClose::Settle,
+            &[
+                remote(1, RemoteState::Open, t0()),
+                remote(2, RemoteState::Open, t0()),
+            ],
+        );
         assert_eq!(s.count_unseen(), 2);
         let a = s.tasks()[0].id.clone();
         s.settle(&a).unwrap();
         assert!(!s.get(&a).unwrap().unseen);
         assert_eq!(s.count_unseen(), 1);
-        s.apply_remote(&[remote(2, RemoteState::Merged, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(2, RemoteState::Merged, t0())]);
         assert_eq!(s.count_unseen(), 0);
     }
 
@@ -968,19 +1011,22 @@ mod tests {
     #[test]
     fn leaving_the_queries_settles_an_active_task_once() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         // You reviewed it: the review request is gone, the PR is still open.
-        let ev = s.apply_remote(&[dropped(1, t0())]);
+        let ev = s.apply_remote(OnClose::Settle, &[dropped(1, t0())]);
         assert!(matches!(ev.as_slice(), [SyncEvent::Released { .. }]));
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
         // Still out of the queries, no activity: nothing happens.
-        assert!(s.apply_remote(&[dropped(1, t0())]).is_empty());
+        assert!(
+            s.apply_remote(OnClose::Settle, &[dropped(1, t0())])
+                .is_empty()
+        );
         // The author pushes: it wakes, and stays awake on the next poll.
-        let ev = s.apply_remote(&[dropped(1, t0() + Duration::minutes(1))]);
+        let ev = s.apply_remote(OnClose::Settle, &[dropped(1, t0() + Duration::minutes(1))]);
         assert!(matches!(ev.as_slice(), [SyncEvent::Woken { .. }]));
         assert!(
-            s.apply_remote(&[dropped(1, t0() + Duration::minutes(1))])
+            s.apply_remote(OnClose::Settle, &[dropped(1, t0() + Duration::minutes(1))])
                 .is_empty()
         );
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
@@ -989,12 +1035,12 @@ mod tests {
     #[test]
     fn re_entering_the_queries_wakes_a_settled_task() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
-        s.apply_remote(&[dropped(1, t0())]);
+        s.apply_remote(OnClose::Settle, &[dropped(1, t0())]);
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
         // Review requested again.
-        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        let ev = s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         assert!(matches!(ev.as_slice(), [SyncEvent::Requested { .. }]));
         let t = s.get(&id).unwrap();
         assert_eq!(t.rung(), Rung::Active);
@@ -1004,10 +1050,13 @@ mod tests {
     #[test]
     fn leaving_the_queries_leaves_pinned_tasks_alone() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         s.set_pinned(&id, true).unwrap();
-        assert!(s.apply_remote(&[dropped(1, t0())]).is_empty());
+        assert!(
+            s.apply_remote(OnClose::Settle, &[dropped(1, t0())])
+                .is_empty()
+        );
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
         assert!(s.get(&id).unwrap().pinned);
     }
@@ -1018,12 +1067,15 @@ mod tests {
         let now = Utc::now();
         let cutoff = now - Duration::days(365);
         let old = now - Duration::days(400);
-        s.apply_remote(&[
-            remote(1, RemoteState::Open, old),
-            remote(2, RemoteState::Open, now - Duration::days(1)),
-            remote(3, RemoteState::Open, old),
-            remote(4, RemoteState::Open, old),
-        ]);
+        s.apply_remote(
+            OnClose::Settle,
+            &[
+                remote(1, RemoteState::Open, old),
+                remote(2, RemoteState::Open, now - Duration::days(1)),
+                remote(3, RemoteState::Open, old),
+                remote(4, RemoteState::Open, old),
+            ],
+        );
         let ids: Vec<String> = s.tasks().iter().map(|t| t.id.clone()).collect();
         s.set_pinned(&ids[2], true).unwrap();
         s.archive(&ids[3]).unwrap();
@@ -1040,9 +1092,43 @@ mod tests {
     }
 
     #[test]
+    fn on_close_archive_sends_closed_items_to_the_archive() {
+        let mut s = Store::in_memory();
+        s.apply_remote(
+            OnClose::Archive,
+            &[
+                remote(1, RemoteState::Open, t0()),
+                remote(2, RemoteState::Open, t0()),
+            ],
+        );
+        let ids: Vec<String> = s.tasks().iter().map(|t| t.id.clone()).collect();
+        s.set_pinned(&ids[0], true).unwrap();
+        s.settle(&ids[1]).unwrap();
+        let ev = s.apply_remote(
+            OnClose::Archive,
+            &[
+                remote(1, RemoteState::Merged, t0()),
+                remote(2, RemoteState::Closed, t0()),
+            ],
+        );
+        assert_eq!(ev.len(), 2);
+        for id in &ids {
+            let t = s.get(id).unwrap();
+            assert_eq!(t.rung(), Rung::Archived);
+            assert!(!t.pinned);
+        }
+        // Reopened remotely: back to Active, like any archived task.
+        s.apply_remote(
+            OnClose::Archive,
+            &[remote(2, RemoteState::Open, t0() + Duration::minutes(1))],
+        );
+        assert_eq!(s.get(&ids[1]).unwrap().rung(), Rung::Active);
+    }
+
+    #[test]
     fn untracked_closed_items_are_ignored() {
         let mut s = Store::in_memory();
-        let ev = s.apply_remote(&[remote(9, RemoteState::Closed, t0())]);
+        let ev = s.apply_remote(OnClose::Settle, &[remote(9, RemoteState::Closed, t0())]);
         assert!(ev.is_empty());
         assert!(s.tasks().is_empty());
     }
@@ -1050,14 +1136,14 @@ mod tests {
     #[test]
     fn user_rename_survives_sync_until_remote_title_changes() {
         let mut s = Store::in_memory();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         s.rename(&id, "My name").unwrap();
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         assert_eq!(s.get(&id).unwrap().title, "My name");
         let mut item = remote(1, RemoteState::Open, t0());
         item.title = "Renamed upstream".into();
-        s.apply_remote(&[item]);
+        s.apply_remote(OnClose::Settle, &[item]);
         assert_eq!(s.get(&id).unwrap().title, "My name");
         assert_eq!(
             s.get(&id).unwrap().remote_title.as_deref(),
@@ -1069,7 +1155,7 @@ mod tests {
     fn roundtrips_through_json() {
         let mut s = Store::in_memory();
         s.add_manual("m", "notes", Some("https://example.com".into()));
-        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let text = serde_json::to_string(&s.data).unwrap();
         let back: StoreData = serde_json::from_str(&text).unwrap();
         assert_eq!(back.tasks, s.data.tasks);

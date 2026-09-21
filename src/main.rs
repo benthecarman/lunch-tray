@@ -136,11 +136,12 @@ fn main() -> anyhow::Result<()> {
     // Remote sync.
     let forges = sync::build_forges(&cfg, &shared);
     let interval = Duration::from_secs(cfg.poll_interval_secs.max(15));
+    let on_close = cfg.on_close;
     {
         let shared = shared.clone();
         std::thread::Builder::new()
             .name("sync".into())
-            .spawn(move || sync::run_loop(forges, shared, sync_rx, interval))?;
+            .spawn(move || sync::run_loop(forges, shared, sync_rx, interval, on_close))?;
     }
 
     systemd::notify("READY=1\n");

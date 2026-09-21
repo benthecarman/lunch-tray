@@ -90,6 +90,7 @@ watches GitHub through the token from `gh auth token`.
 
 ```toml
 poll_interval_secs = 120
+on_close = "settle"   # or "archive": closed and merged items skip Settled
 
 [[github]]
 # token = "ghp_..."            # or token_env, GITHUB_TOKEN, or `gh auth token`
@@ -168,7 +169,8 @@ notice. Once the item is closed or merged, delete works too.
 Sync applies these rules to tracked items:
 
 - open, not tracked: new Active task
-- open to closed or merged: an Active task settles
+- open to closed or merged: an Active task settles, or goes to Archived
+  when `on_close = "archive"` (a Settled task moves too)
 - closed to open: a Settled or Archived task reopens
 - open but no longer in any of your queries, for example after you submit
   a review: an Active task settles. Pinned tasks stay.
