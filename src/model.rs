@@ -375,14 +375,25 @@ impl Store {
             .count()
     }
 
-    /// Newest task in `project` that is not archived, other than `exclude`.
-    pub fn newest_unarchived_in_project(&self, project: &str, exclude: &str) -> Option<String> {
-        self.data
+    /// Archive every unarchived task that `pred` selects. Returns their labels.
+    pub fn archive_matching(&mut self, pred: impl Fn(&Task) -> bool) -> Vec<String> {
+        let ids: Vec<(String, String)> = self
+            .data
             .tasks
             .iter()
-            .filter(|t| t.project == project && t.id != exclude && t.state != TaskState::Archived)
-            .max_by_key(|t| t.updated_at)
-            .map(|t| t.id.clone())
+            .filter(|t| t.state != TaskState::Archived && pred(t))
+            .map(|t| {
+                let label = t
+                    .remote()
+                    .map(|r| r.label())
+                    .unwrap_or_else(|| t.title.clone());
+                (t.id.clone(), label)
+            })
+            .collect();
+        ids.into_iter()
+            .filter(|(id, _)| self.archive(id).unwrap_or(false))
+            .map(|(_, label)| label)
+            .collect()
     }
 
     // ----- transitions ------------------------------------------------------
@@ -1043,27 +1054,6 @@ mod tests {
             s.get(&id).unwrap().remote_title.as_deref(),
             Some("Renamed upstream")
         );
-    }
-
-    #[test]
-    fn selection_fallback_picks_newest_unarchived_in_project() {
-        let mut s = Store::in_memory();
-        let a = s.add_manual("a", "", None);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let b = s.add_manual("b", "", None);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let c = s.add_manual("c", "", None);
-        s.archive(&c).unwrap();
-        assert_eq!(
-            s.newest_unarchived_in_project(LOCAL_PROJECT, &a),
-            Some(b.clone())
-        );
-        assert_eq!(
-            s.newest_unarchived_in_project(LOCAL_PROJECT, &b),
-            Some(a.clone())
-        );
-        s.archive(&a).unwrap();
-        assert_eq!(s.newest_unarchived_in_project(LOCAL_PROJECT, &b), None);
     }
 
     #[test]

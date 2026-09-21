@@ -113,6 +113,15 @@ queries = [
 GitHub queries use the search syntax. Forgejo queries are query strings for
 `/api/v1/repos/issues/search`.
 
+To ignore repositories, add `exclude` to an account with `owner/repo` or
+`owner/*` patterns. Their items are never added, and any tasks already
+tracked from them are archived on the next sync:
+
+```toml
+[[github]]
+exclude = ["someorg/noisy-repo", "archived-org/*"]
+```
+
 For a Forgejo token: your avatar, Settings, Applications, Generate token,
 with read access to issues, repositories, and your user. Without a token the
 search ignores the `created`, `assigned`, and `review_requested` filters and

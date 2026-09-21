@@ -96,7 +96,6 @@ enum MenuAction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
-    Select(String),
     OpenLink(String),
     Settle(String),
     Reopen(String),
@@ -109,10 +108,8 @@ enum Action {
 pub struct App {
     shared: SharedRef,
     mode: WindowMode,
-    selected: Option<String>,
     modal: Option<Modal>,
     theme_applied: Option<egui::Theme>,
-    scroll_to_selected: bool,
     collapsed: HashSet<&'static str>,
     /// Row whose overflow menu is open, so its buttons stay while the
     /// pointer is inside the menu.
@@ -148,10 +145,8 @@ impl App {
         let mut app = App {
             shared,
             mode,
-            selected: None,
             modal: None,
             theme_applied: None,
-            scroll_to_selected: false,
             collapsed: HashSet::new(),
             menu_row: None,
             was_focused: false,
@@ -166,6 +161,10 @@ impl App {
             s.window_mode = Some(mode);
         }
         style::apply(&cc.egui_ctx);
+        // egui's default of 40 points per wheel notch feels sluggish next to
+        // GTK apps. About one and a half rows per notch matches them.
+        cc.egui_ctx
+            .options_mut(|o| o.input_options.line_scroll_speed = 90.0);
         if open_add {
             app.modal = Some(new_task_modal());
         }
@@ -183,33 +182,33 @@ impl App {
         }
     }
 
-    fn select(&mut self, id: Option<String>) {
-        if let Some(id) = &id {
-            let mut s = self.shared.lock().unwrap();
-            if s.store.mark_seen(id) {
-                s.save_store();
-                s.notify();
-            }
-        }
-        self.selected = id;
-    }
-
     fn act(&mut self, action: Action) {
         match action {
-            Action::Select(id) => self.select(Some(id)),
             Action::OpenLink(id) => {
-                let url = {
-                    let s = self.shared.lock().unwrap();
-                    s.store.get(&id).and_then(|t| t.url().map(str::to_string))
+                let (url, manual) = {
+                    let mut s = self.shared.lock().unwrap();
+                    if s.store.mark_seen(&id) {
+                        s.save_store();
+                        s.notify();
+                    }
+                    let t = s.store.get(&id);
+                    (
+                        t.and_then(|t| t.url().map(str::to_string)),
+                        t.is_some_and(|t| t.origin == Origin::Manual),
+                    )
                 };
-                self.select(Some(id));
-                if let Some(url) = url
-                    && let Err(e) = open::that_detached(&url)
-                {
-                    self.shared
-                        .lock()
-                        .unwrap()
-                        .push_notice(Notice::error(format!("Could not open {url}: {e}")));
+                match url {
+                    Some(url) => {
+                        if let Err(e) = open::that_detached(&url) {
+                            self.shared
+                                .lock()
+                                .unwrap()
+                                .push_notice(Notice::error(format!("Could not open {url}: {e}")));
+                        }
+                    }
+                    // A note without a link: open it for editing.
+                    None if manual => self.act(Action::Rename(id)),
+                    None => {}
                 }
             }
             Action::Settle(id) => {
@@ -223,14 +222,9 @@ impl App {
                 finish(&mut s, r);
             }
             Action::Archive(id) => {
-                let project = self.project_of(&id);
                 let mut s = self.shared.lock().unwrap();
                 let r = s.store.archive(&id);
-                let changed = finish(&mut s, r);
-                drop(s);
-                if changed && let Some(project) = project {
-                    self.leave_project(&id, &project);
-                }
+                finish(&mut s, r);
             }
             Action::Delete(id) => {
                 let title = self
@@ -268,41 +262,10 @@ impl App {
         }
     }
 
-    fn project_of(&self, id: &str) -> Option<String> {
-        self.shared
-            .lock()
-            .unwrap()
-            .store
-            .get(id)
-            .map(|t| t.project.clone())
-    }
-
-    /// Selection after archive or delete: newest unarchived task in the same
-    /// project, or nothing.
-    fn leave_project(&mut self, id: &str, project: &str) {
-        if self.selected.as_deref() != Some(id) {
-            return;
-        }
-        let s = self.shared.lock().unwrap();
-        let next = s.store.newest_unarchived_in_project(project, id);
-        drop(s);
-        self.selected = next;
-    }
-
     fn confirm_delete(&mut self, id: &str) {
-        let project = self.project_of(id);
         let mut s = self.shared.lock().unwrap();
         let r = s.store.delete(id);
-        let changed = finish(&mut s, r);
-        drop(s);
-        if changed {
-            if let Some(project) = project {
-                self.leave_project(id, &project);
-            }
-            if self.selected.as_deref() == Some(id) {
-                self.selected = None;
-            }
-        }
+        finish(&mut s, r);
     }
 
     fn save_task(&mut self, id: Option<String>, title: &str, notes: &str, link: &str) -> bool {
@@ -313,11 +276,9 @@ impl App {
                     s.push_notice(Notice::error("A task needs a title."));
                     return false;
                 }
-                let id = s.store.add_manual(title, notes, Some(link.to_string()));
+                s.store.add_manual(title, notes, Some(link.to_string()));
                 s.save_store();
                 s.notify();
-                drop(s);
-                self.selected = Some(id);
                 true
             }
             Some(id) => {
@@ -346,42 +307,11 @@ impl App {
         }
     }
 
-    fn handle_keys(&mut self, ctx: &egui::Context, visible: &[String]) {
+    fn handle_keys(&mut self, ctx: &egui::Context) {
         if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
-        let (up, down, enter, delete, escape) = ctx.input(|i| {
-            (
-                i.key_pressed(Key::ArrowUp),
-                i.key_pressed(Key::ArrowDown),
-                i.key_pressed(Key::Enter),
-                i.key_pressed(Key::Delete),
-                i.key_pressed(Key::Escape),
-            )
-        });
-        if up || down {
-            let idx = self
-                .selected
-                .as_ref()
-                .and_then(|s| visible.iter().position(|v| v == s));
-            let next = match (idx, up) {
-                (None, _) => visible.first().cloned(),
-                (Some(0), true) => visible.first().cloned(),
-                (Some(i), true) => visible.get(i - 1).cloned(),
-                (Some(i), false) => visible.get(i + 1).or(visible.last()).cloned(),
-            };
-            if next.is_some() {
-                self.select(next);
-                self.scroll_to_selected = true;
-            }
-        }
-        if enter && let Some(id) = self.selected.clone() {
-            self.act(Action::OpenLink(id));
-        }
-        if delete && let Some(id) = self.selected.clone() {
-            self.act(Action::Delete(id));
-        }
-        if escape && self.mode == WindowMode::Popover {
+        if self.mode == WindowMode::Popover && ctx.input(|i| i.key_pressed(Key::Escape)) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
@@ -540,7 +470,6 @@ impl eframe::App for App {
         }
 
         let mut actions: Vec<Action> = Vec::new();
-        let mut visible: Vec<String> = Vec::new();
 
         let panel_frame = |margin: Margin| {
             if popover {
@@ -573,16 +502,12 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.add_space(6.0);
-                        self.task_list(ui, &p, &frame, &mut actions, &mut visible);
+                        self.task_list(ui, &p, &frame, &mut actions);
                         ui.add_space(8.0);
                     });
             });
 
         self.notices_overlay(ctx, &p, &frame);
-        if self.screenshot.is_some() && self.selected.is_none() {
-            // Show the row actions in development screenshots.
-            self.selected = visible.first().cloned();
-        }
 
         for a in actions {
             self.act(a);
@@ -592,7 +517,7 @@ impl eframe::App for App {
         if self.modal.is_some() {
             self.modal_ui(ctx, &p);
         } else {
-            self.handle_keys(ctx, &visible);
+            self.handle_keys(ctx);
         }
     }
 
@@ -811,7 +736,6 @@ impl App {
         p: &Palette,
         frame: &Frame,
         actions: &mut Vec<Action>,
-        visible: &mut Vec<String>,
     ) {
         let popover = self.mode == WindowMode::Popover;
         let s = &frame.sections;
@@ -838,9 +762,9 @@ impl App {
             });
             return;
         }
-        let selected = self.selected.clone();
-        let scroll = std::mem::take(&mut self.scroll_to_selected);
         let menu_row = self.menu_row.take();
+        // Development screenshots show the first row's actions.
+        let mut force_actions = self.screenshot.is_some();
         let mut next_menu_row: Option<String> = None;
         let mut sections: Vec<(&'static str, &Vec<Task>)> =
             vec![("Pinned", &s.pinned), ("Active", &s.active)];
@@ -877,13 +801,10 @@ impl App {
                     return;
                 }
                 for t in tasks {
-                    visible.push(t.id.clone());
-                    let is_selected = selected.as_deref() == Some(t.id.as_str());
                     let ctx = RowCtx {
-                        selected: is_selected,
-                        scroll_to: scroll && is_selected,
                         compact: popover,
                         menu_open: menu_row.as_deref() == Some(t.id.as_str()),
+                        force_actions: std::mem::take(&mut force_actions),
                     };
                     if row(ui, p, t, ctx, actions) {
                         next_menu_row = Some(t.id.clone());
@@ -1055,15 +976,6 @@ impl App {
                     } else {
                         format!("Archived {archived} tasks")
                     }));
-                    drop(s);
-                    if let Some(sel) = self.selected.clone()
-                        && ids.contains(&sel)
-                    {
-                        let project = self.project_of(&sel);
-                        if let Some(project) = project {
-                            self.leave_project(&sel, &project);
-                        }
-                    }
                 } else if !cancel && !resp.should_close() {
                     self.modal = Some(Modal::ConfirmArchiveStale { ids, fresh: false });
                 }
@@ -1269,46 +1181,32 @@ fn subtitle(t: &Task, compact: bool) -> String {
 
 /// Per-row view state.
 struct RowCtx {
-    selected: bool,
-    scroll_to: bool,
     compact: bool,
     menu_open: bool,
+    force_actions: bool,
 }
 
 /// One task row. Emits actions instead of mutating anything. Returns true
 /// while the row's overflow menu is open.
 fn row(ui: &mut egui::Ui, p: &Palette, t: &Task, ctx: RowCtx, actions: &mut Vec<Action>) -> bool {
     let RowCtx {
-        selected,
-        scroll_to,
         compact,
         menu_open,
+        force_actions,
     } = ctx;
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::click());
-    if scroll_to {
-        resp.scroll_to_me(None);
-    }
-    let hovered = ui.rect_contains_pointer(rect);
-    let show_actions = hovered || selected || menu_open;
+    let hovered = ui.rect_contains_pointer(rect) || force_actions;
+    let show_actions = hovered || menu_open;
 
-    if selected {
-        ui.painter().rect_filled(
-            rect,
-            CornerRadius::same(RADIUS),
-            tint(p.accent, if p.dark { 40 } else { 44 }),
-        );
-        let bar = Rect::from_min_size(rect.min + vec2(0.0, 10.0), vec2(3.0, rect.height() - 20.0));
-        ui.painter()
-            .rect_filled(bar, CornerRadius::same(2), p.accent);
-    } else if hovered {
+    if hovered {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(RADIUS), p.bg);
     }
-    if resp.double_clicked() {
+    // A click on the row opens it: the link in the browser, or the editor
+    // for a note without a link.
+    if resp.clicked() {
         actions.push(Action::OpenLink(t.id.clone()));
-    } else if resp.clicked() {
-        actions.push(Action::Select(t.id.clone()));
     }
 
     // Leading glyph in its state color, with a mustard badge for new activity.
@@ -1324,7 +1222,7 @@ fn row(ui: &mut egui::Ui, p: &Palette, t: &Task, ctx: RowCtx, actions: &mut Vec<
     if t.unseen && t.state == TaskState::Active {
         let dot = glyph_center + vec2(9.0, -9.0);
         ui.painter()
-            .circle_filled(dot, 5.5, if selected { p.bg } else { p.well });
+            .circle_filled(dot, 5.5, if hovered { p.bg } else { p.well });
         ui.painter().circle_filled(dot, 4.0, p.accent);
     }
 

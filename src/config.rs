@@ -43,6 +43,8 @@ poll_interval_secs = 120
 #   "is:open is:pr review-requested:@me archived:false",
 #   "is:open assignee:@me archived:false",
 # ]
+# Repositories to ignore, as owner/repo or owner/*.
+# exclude = ["someorg/noisy-repo", "archived-org/*"]
 
 # Forgejo or Gitea instances.
 # [[forgejo]]
@@ -55,6 +57,7 @@ poll_interval_secs = 120
 #   "type=pulls&review_requested=true",
 #   "type=issues&assigned=true",
 # ]
+# exclude = ["someorg/noisy-repo"]
 "#;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -93,6 +96,9 @@ pub struct GithubAccount {
     pub token_env: Option<String>,
     #[serde(default = "default_github_queries")]
     pub queries: Vec<String>,
+    /// Repositories to ignore: `owner/repo` or `owner/*`.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 impl Default for GithubAccount {
@@ -102,6 +108,7 @@ impl Default for GithubAccount {
             token: None,
             token_env: None,
             queries: default_github_queries(),
+            exclude: Vec::new(),
         }
     }
 }
@@ -183,6 +190,9 @@ pub struct ForgejoAccount {
     pub token_env: Option<String>,
     #[serde(default = "default_forgejo_queries")]
     pub queries: Vec<String>,
+    /// Repositories to ignore: `owner/repo` or `owner/*`.
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 impl ForgejoAccount {
@@ -211,6 +221,17 @@ fn default_forgejo_queries() -> Vec<String> {
         "type=pulls&review_requested=true".into(),
         "type=issues&assigned=true".into(),
     ]
+}
+
+/// True when `owner/repo` matches one of the exclude patterns. Patterns are
+/// `owner/repo` or `owner/*`, compared without regard to case.
+pub fn is_excluded(patterns: &[String], owner: &str, repo: &str) -> bool {
+    patterns.iter().any(|pat| {
+        let Some((p_owner, p_repo)) = pat.trim().split_once('/') else {
+            return false;
+        };
+        p_owner.eq_ignore_ascii_case(owner) && (p_repo == "*" || p_repo.eq_ignore_ascii_case(repo))
+    })
 }
 
 impl Config {
@@ -249,6 +270,20 @@ mod tests {
     }
 
     #[test]
+    fn exclude_patterns_match_repos_and_owners() {
+        let pats = vec![
+            "Acme/Widgets".to_string(),
+            "noisy/*".to_string(),
+            "bad".to_string(),
+        ];
+        assert!(is_excluded(&pats, "acme", "widgets"));
+        assert!(!is_excluded(&pats, "acme", "gadgets"));
+        assert!(is_excluded(&pats, "noisy", "anything"));
+        assert!(!is_excluded(&pats, "quiet", "anything"));
+        assert!(!is_excluded(&[], "acme", "widgets"));
+    }
+
+    #[test]
     fn hosts_are_derived_from_urls() {
         let gh = GithubAccount {
             api_url: "https://ghe.example.com/api/v3".into(),
@@ -260,6 +295,7 @@ mod tests {
             token: None,
             token_env: None,
             queries: vec![],
+            exclude: vec![],
         };
         assert_eq!(fj.host(), "codeberg.org");
     }

@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use crate::config::{Config, ForgejoAccount, GithubAccount};
+use crate::config::{Config, ForgejoAccount, GithubAccount, is_excluded};
 use crate::model::{Provider, RemoteItem, RemoteKind, RemoteRef, RemoteState, SyncEvent};
 use crate::shared::{Notice, SharedRef};
 
@@ -29,6 +29,8 @@ pub trait Forge: Send {
     fn fetch_open(&self) -> Result<Vec<RemoteItem>>;
     /// One item by number, whatever its state.
     fn fetch_one(&self, owner: &str, repo: &str, number: u64) -> Result<RemoteItem>;
+    /// Repository patterns to ignore.
+    fn exclude(&self) -> &[String];
 }
 
 /// One HTTP client per account. Error statuses come back as responses so
@@ -220,6 +222,7 @@ pub struct GitHub {
     host: String,
     token: String,
     queries: Vec<String>,
+    exclude: Vec<String>,
     http: Http,
 }
 
@@ -230,6 +233,7 @@ impl GitHub {
             host: acc.host(),
             token: acc.resolve_token()?,
             queries: acc.queries.clone(),
+            exclude: acc.exclude.clone(),
             http: Http::new(),
         })
     }
@@ -325,6 +329,10 @@ impl Forge for GitHub {
         self.host.clone()
     }
 
+    fn exclude(&self) -> &[String] {
+        &self.exclude
+    }
+
     fn fetch_open(&self) -> Result<Vec<RemoteItem>> {
         let mut out = Vec::new();
         for q in &self.queries {
@@ -360,6 +368,7 @@ pub struct Forgejo {
     host: String,
     token: String,
     queries: Vec<String>,
+    exclude: Vec<String>,
     http: Http,
 }
 
@@ -370,6 +379,7 @@ impl Forgejo {
             host: acc.host(),
             token: acc.resolve_token()?,
             queries: acc.queries.clone(),
+            exclude: acc.exclude.clone(),
             http: Http::new(),
         })
     }
@@ -472,6 +482,10 @@ impl Forge for Forgejo {
 
     fn host(&self) -> String {
         self.host.clone()
+    }
+
+    fn exclude(&self) -> &[String] {
+        &self.exclude
     }
 
     fn fetch_open(&self) -> Result<Vec<RemoteItem>> {
@@ -602,6 +616,8 @@ pub fn sync_once(forges: &[Box<dyn Forge>], shared: &SharedRef, round: usize) {
 
 fn sync_forge(forge: &dyn Forge, shared: &SharedRef, round: usize) -> Result<()> {
     let mut items = forge.fetch_open()?;
+    let excluded = |r: &RemoteRef| is_excluded(forge.exclude(), &r.owner, &r.repo);
+    items.retain(|i| !excluded(&i.r));
     let seen: HashSet<String> = items.iter().map(|i| i.r.key()).collect();
 
     // Tracked open items that the queries no longer return: check each one
@@ -617,6 +633,7 @@ fn sync_forge(forge: &dyn Forge, shared: &SharedRef, round: usize) -> Result<()>
                     && r.host == forge.host()
                     && r.state == RemoteState::Open
                     && !seen.contains(&r.key())
+                    && !excluded(r)
             })
             .collect()
     };
@@ -649,8 +666,18 @@ fn sync_forge(forge: &dyn Forge, shared: &SharedRef, round: usize) -> Result<()>
     }
 
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    // Tasks from repositories that are now excluded go to the archive.
+    let put_away = s.store.archive_matching(|t| {
+        t.remote().is_some_and(|r| {
+            r.provider == forge.provider() && r.host == forge.host() && excluded(r)
+        })
+    });
+    let excluded_any = !put_away.is_empty();
+    for label in put_away {
+        s.push_notice(Notice::info(format!("Excluded repository: {label}")));
+    }
     let events = s.store.apply_remote(&items);
-    if !events.is_empty()
+    if (!events.is_empty() || excluded_any)
         && let Err(e) = s.store.save()
     {
         log::error!("save store: {e:#}");
@@ -699,6 +726,7 @@ mod tests {
             host: "github.com".into(),
             token: String::new(),
             queries: vec![],
+            exclude: vec![],
             http: Http::new(),
         };
         let json = r#"{"number": 7, "title": "Fix it", "html_url": "https://github.com/o/r/pull/7",
@@ -721,6 +749,7 @@ mod tests {
             host: "codeberg.org".into(),
             token: String::new(),
             queries: vec![],
+            exclude: vec![],
             http: Http::new(),
         };
         let json = r#"{"number": 3, "title": "Bug", "html_url": "https://codeberg.org/o/r/issues/3",
