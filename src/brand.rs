@@ -18,8 +18,11 @@ fn sd_round_rect(x: f32, y: f32, half: f32, radius: f32) -> f32 {
 
 /// True when the unit-square point is on the tray mark: the rim or the
 /// divider between the two compartments.
+/// Vertical center of the mark in its own unit square.
+const MARK_CENTER_Y: f32 = 0.56;
+
 pub fn on_mark(x: f32, y: f32) -> bool {
-    let rim = sd_round_rect(x - 0.5, (y - 0.56) * 1.35, 0.44, 0.16);
+    let rim = sd_round_rect(x - 0.5, (y - MARK_CENTER_Y) * 1.35, 0.44, 0.16);
     let in_rim = (-0.1..=0.0).contains(&rim);
     let inside = rim < -0.1;
     let in_divider = inside && (x - 0.4).abs() <= 0.045;
@@ -87,8 +90,10 @@ pub fn app_icon_rgba(size: usize) -> Vec<u8> {
         let d = sd_round_rect(px - 0.5, py - 0.5, 0.47, 0.11);
         (-0.02..=0.0).contains(&d)
     };
-    // The mark sits centered at 64% of the tile.
-    let mark = |px: f32, py: f32| on_mark((px - 0.5) / 0.64 + 0.5, (py - 0.5) / 0.64 + 0.5);
+    // The mark sits centered at 64% of the tile. Its own geometry is drawn
+    // a little low to leave room for the tray badge, so lift it back.
+    let mark =
+        |px: f32, py: f32| on_mark((px - 0.5) / 0.64 + 0.5, (py - 0.5) / 0.64 + MARK_CENTER_Y);
     for y in 0..size {
         for x in 0..size {
             let t = coverage(x, y, size, tile);
@@ -116,8 +121,33 @@ fn blend(base: [u8; 3], top: [u8; 3], t: f32) -> [u8; 3] {
     ]
 }
 
-/// Write launcher icons into a hicolor theme directory.
+/// The launcher icon as SVG, the same tile and mark as the raster version,
+/// for the sizes GNOME renders on the fly.
+pub fn app_icon_svg() -> String {
+    let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+    // Mark strokes are centered on their path: the rim's half extent is
+    // 0.44 with a 0.1 band inside it, so the centerline sits at 0.39.
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect x="3.84" y="3.84" width="120.32" height="120.32" rx="14.08" fill="{bg}" stroke="{edge}" stroke-width="2.56"/>
+  <g transform="translate(64 64) scale(81.92) scale(1 0.7407)" fill="none" stroke="{ink}" stroke-linecap="butt">
+    <rect x="-0.39" y="-0.39" width="0.78" height="0.78" rx="0.11" stroke-width="0.1"/>
+    <path d="M -0.1 -0.34 V 0.34" stroke-width="0.09"/>
+  </g>
+</svg>
+"##,
+        bg = hex(ICON_BG),
+        edge = hex(ICON_EDGE),
+        ink = hex(ICON_INK),
+    )
+}
+
+/// Write launcher icons into a hicolor theme directory: PNGs for every
+/// common size and an SVG for the rest.
 pub fn export_icons(hicolor: &Path) -> Result<()> {
+    let scalable = hicolor.join("scalable").join("apps");
+    std::fs::create_dir_all(&scalable)?;
+    std::fs::write(scalable.join("lunch-tray.svg"), app_icon_svg())?;
     for size in [16usize, 22, 24, 32, 48, 64, 128, 256, 512] {
         let dir = hicolor.join(format!("{size}x{size}")).join("apps");
         std::fs::create_dir_all(&dir)?;
@@ -159,5 +189,33 @@ mod tests {
         assert!(ink > 100 && bg > 1000, "ink {ink} bg {bg}");
         // Corners are transparent.
         assert_eq!(icon[3], 0);
+    }
+
+    #[test]
+    fn app_icon_is_vertically_centered() {
+        let size = 128;
+        let icon = app_icon_rgba(size);
+        let ink_rows: Vec<usize> = (0..size)
+            .filter(|y| {
+                (0..size).any(|x| {
+                    let i = (y * size + x) * 4;
+                    icon[i] == 0x18 && icon[i + 3] == 255
+                })
+            })
+            .collect();
+        let top = *ink_rows.first().unwrap();
+        let bottom = size - 1 - *ink_rows.last().unwrap();
+        assert!(
+            (top as i64 - bottom as i64).abs() <= 1,
+            "top {top} bottom {bottom}"
+        );
+    }
+
+    #[test]
+    fn svg_icon_is_well_formed() {
+        let svg = app_icon_svg();
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.trim_end().ends_with("</svg>"));
+        assert!(svg.contains("#18211c"));
     }
 }
