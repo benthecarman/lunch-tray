@@ -1382,45 +1382,75 @@ fn row(ui: &mut egui::Ui, p: &Palette, t: &Task, ctx: RowCtx, actions: &mut Vec<
     left.add_space((ROW_HEIGHT - 36.0) / 2.0);
     left.spacing_mut().item_spacing = vec2(6.0, 2.0);
     left.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
         if t.pinned && t.rung() == Rung::Active {
             ui.label(RichText::new(icons::PUSH_PIN).size(13.0).color(p.accent));
         }
-        ui.add(
-            Label::new(
-                RichText::new(&t.title)
-                    .text_style(title_style())
-                    .color(p.text),
-            )
-            .truncate(),
-        );
-    });
-    left.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        checks_badge(ui, p, t);
-        ui.add(
-            Label::new(
-                RichText::new(subtitle(t, compact))
+        // The badges sit after the title, so the title gives up their width
+        // before it truncates.
+        let badges = check_badges(p, t);
+        let font = TextStyle::Small.resolve(ui.style());
+        let badges_w: f32 = badges
+            .iter()
+            .map(|b| {
+                ui.fonts_mut(|f| {
+                    f.layout_no_wrap(b.text.clone(), font.clone(), b.color)
+                        .size()
+                        .x
+                }) + 8.0
+            })
+            .sum();
+        let title_w = (ui.available_width() - badges_w).max(60.0);
+        ui.scope(|ui| {
+            ui.set_max_width(title_w);
+            ui.add(
+                Label::new(
+                    RichText::new(&t.title)
+                        .text_style(title_style())
+                        .color(p.text),
+                )
+                .truncate(),
+            );
+        });
+        for b in badges {
+            ui.label(
+                RichText::new(b.text)
                     .text_style(TextStyle::Small)
-                    .color(p.text_weak),
+                    .color(b.color),
             )
-            .truncate(),
-        );
+            .on_hover_text(b.tip);
+        }
     });
+    left.add(
+        Label::new(
+            RichText::new(subtitle(t, compact))
+                .text_style(TextStyle::Small)
+                .color(p.text_weak),
+        )
+        .truncate(),
+    );
     menu_is_open
 }
 
-/// CI result and merge state of an open pull request, ahead of the meta
-/// line: passed over total in green, red while something failed, mustard
+struct Badge {
+    text: String,
+    color: Color32,
+    tip: String,
+}
+
+/// CI result and merge state of an open pull request, shown after the
+/// title: passed over total in green, red while something failed, mustard
 /// while runs are going, and a warning when the branch has conflicts.
-fn checks_badge(ui: &mut egui::Ui, p: &Palette, t: &Task) {
+fn check_badges(p: &Palette, t: &Task) -> Vec<Badge> {
+    let mut out = Vec::new();
     let Some(r) = t.remote() else {
-        return;
+        return out;
     };
     if r.state != RemoteState::Open {
-        return;
+        return out;
     }
     let Some(c) = &r.checks else {
-        return;
+        return out;
     };
     if c.total > 0 {
         let (icon, color, tip) = if c.failed > 0 {
@@ -1438,12 +1468,11 @@ fn checks_badge(ui: &mut egui::Ui, p: &Palette, t: &Task) {
         } else {
             (icons::CHECK_CIRCLE, p.open, "All checks passed".to_string())
         };
-        ui.label(
-            RichText::new(format!("{icon} {}/{}", c.passed, c.total))
-                .text_style(TextStyle::Small)
-                .color(color),
-        )
-        .on_hover_text(tip);
+        out.push(Badge {
+            text: format!("{icon} {}/{}", c.passed, c.total),
+            color,
+            tip,
+        });
     }
     let conflict = match c.merge {
         MergeState::Conflicting => Some("Conflicts with the base branch: needs a rebase"),
@@ -1451,13 +1480,13 @@ fn checks_badge(ui: &mut egui::Ui, p: &Palette, t: &Task) {
         _ => None,
     };
     if let Some(tip) = conflict {
-        ui.label(
-            RichText::new(icons::WARNING)
-                .text_style(TextStyle::Small)
-                .color(p.warning),
-        )
-        .on_hover_text(tip);
+        out.push(Badge {
+            text: icons::WARNING.to_string(),
+            color: p.warning,
+            tip: tip.to_string(),
+        });
     }
+    out
 }
 
 /// The overflow menu. Every item is closed from one place, here, before the
