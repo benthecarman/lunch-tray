@@ -58,9 +58,10 @@ threads are up, stops cleanly on SIGTERM, and is restarted on failure. If it
 starts before the shell's tray host, it waits and registers when the host
 appears.
 
-For an entry in the app grid that opens the full window:
+For an entry in the app grid that opens the full window, with its icon:
 
 ```sh
+lunch-tray --export-icons ~/.local/share/icons/hicolor
 install -Dm644 assets/lunch-tray.desktop ~/.local/share/applications/lunch-tray.desktop
 ```
 

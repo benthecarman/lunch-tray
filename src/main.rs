@@ -1,6 +1,7 @@
 //! Lunch Tray: a system tray todo list that follows your pull requests and
 //! issues on GitHub and Forgejo.
 
+mod brand;
 mod config;
 mod model;
 mod shared;
@@ -28,6 +29,9 @@ lunch-tray [--hidden]
 
   --hidden   Start with only the tray icon; open the window from the tray.
   --popover  Start with the compact popover instead of the full window.
+  --export-icons DIR
+             Write launcher icons into DIR, a hicolor theme directory such
+             as ~/.local/share/icons/hicolor, then exit.
   --help     Show this text.
 
 Config:  ~/.config/lunch-tray/config.toml
@@ -51,6 +55,14 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{USAGE}");
+        return Ok(());
+    }
+    if let Some(i) = args.iter().position(|a| a == "--export-icons") {
+        let dir = args
+            .get(i + 1)
+            .context("--export-icons needs a directory")?;
+        brand::export_icons(std::path::Path::new(dir))?;
+        println!("wrote icons under {dir}");
         return Ok(());
     }
     let mut show_window = !args.iter().any(|a| a == "--hidden");

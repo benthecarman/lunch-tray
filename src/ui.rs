@@ -28,7 +28,7 @@ const ERROR_TTL: Duration = Duration::from_secs(20);
 pub fn run_window(shared: SharedRef, mode: WindowMode, open_add: bool) -> eframe::Result {
     let size = 64;
     let icon = egui::IconData {
-        rgba: crate::tray::icon_rgba(size),
+        rgba: crate::brand::app_icon_rgba(size),
         width: size as u32,
         height: size as u32,
     };
@@ -114,6 +114,8 @@ pub struct App {
     /// Row whose overflow menu is open, so its buttons stay while the
     /// pointer is inside the menu.
     menu_row: Option<String>,
+    /// The tray mark, white, tinted where it is drawn.
+    mark: egui::TextureHandle,
     /// The popover closes when it loses focus, once it had focus and the
     /// pointer has been inside it.
     was_focused: bool,
@@ -142,6 +144,14 @@ impl App {
         mode: WindowMode,
         open_add: bool,
     ) -> Self {
+        let mark = cc.egui_ctx.load_texture(
+            "brand-mark",
+            egui::ColorImage::from_rgba_unmultiplied(
+                [64, 64],
+                &crate::brand::mark_rgba(64, [255, 255, 255], None),
+            ),
+            egui::TextureOptions::LINEAR,
+        );
         let mut app = App {
             shared,
             mode,
@@ -149,6 +159,7 @@ impl App {
             theme_applied: None,
             collapsed: HashSet::new(),
             menu_row: None,
+            mark,
             was_focused: false,
             armed: false,
             last_focus: None,
@@ -535,7 +546,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.set_height(30.0);
             ui.add_space(2.0);
-            ui.label(RichText::new(icons::TRAY).size(21.0).color(p.text));
+            ui.add(egui::Image::new((self.mark.id(), Vec2::splat(24.0))).tint(p.text));
             ui.add_space(2.0);
             ui.label(RichText::new("Lunch Tray").text_style(TextStyle::Heading));
             if popover {
@@ -747,7 +758,7 @@ impl App {
         if shown == 0 {
             ui.add_space(56.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new(icons::TRAY).size(44.0).color(p.text_weak));
+                ui.add(egui::Image::new((self.mark.id(), Vec2::splat(48.0))).tint(p.text_weak));
                 ui.add_space(6.0);
                 ui.label(RichText::new("Nothing on your tray").text_style(title_style()));
                 ui.label(

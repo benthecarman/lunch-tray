@@ -243,70 +243,23 @@ enum Dot {
     Error,
 }
 
-fn sd_round_rect(x: f32, y: f32, half: f32, radius: f32) -> f32 {
-    let qx = x.abs() - half + radius;
-    let qy = y.abs() - half + radius;
-    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
-    outside + qx.max(qy).min(0.0) - radius
-}
-
-/// Coverage of the tray glyph (a wide rounded rim with two compartments)
-/// and of the badge dot at a unit point.
-fn shapes(x: f32, y: f32, dot: bool) -> (bool, bool) {
-    // Rim: a rounded rectangle wider than tall, hollow.
-    let rim = sd_round_rect(x - 0.5, (y - 0.56) * 1.35, 0.44, 0.16);
-    let in_rim = (-0.1..=0.0).contains(&rim);
-    // Divider between the two compartments.
-    let inside = rim < -0.1;
-    let in_divider = inside && (x - 0.4).abs() <= 0.045;
-    let in_dot = dot && ((x - 0.82).powi(2) + (y - 0.2).powi(2)).sqrt() <= 0.19;
-    let near_dot = dot && ((x - 0.82).powi(2) + (y - 0.2).powi(2)).sqrt() <= 0.26;
-    ((in_rim || in_divider) && !near_dot, in_dot)
-}
-
 fn render_icon(size: usize, dot: Option<Dot>) -> ksni::Icon {
-    const SS: usize = 4;
-    let mut data = Vec::with_capacity(size * size * 4);
-    let dot_rgb = match dot {
-        Some(Dot::Attention) => (0xe0u8, 0xb2u8, 0x3au8),
-        Some(Dot::Error) => (0xefu8, 0x44u8, 0x44u8),
-        None => (0, 0, 0),
+    let badge = match dot {
+        Some(Dot::Attention) => Some([0xe0, 0xb2, 0x3a]),
+        Some(Dot::Error) => Some([0xef, 0x44, 0x44]),
+        None => None,
     };
-    for y in 0..size {
-        for x in 0..size {
-            let (mut glyph, mut badge) = (0u32, 0u32);
-            for sy in 0..SS {
-                for sx in 0..SS {
-                    let px = (x as f32 + (sx as f32 + 0.5) / SS as f32) / size as f32;
-                    let py = (y as f32 + (sy as f32 + 0.5) / SS as f32) / size as f32;
-                    let (g, b) = shapes(px, py, dot.is_some());
-                    glyph += g as u32;
-                    badge += b as u32;
-                }
-            }
-            let total = (SS * SS) as u32;
-            let (a, r, g, b) = if badge > 0 {
-                ((badge * 255 / total) as u8, dot_rgb.0, dot_rgb.1, dot_rgb.2)
-            } else {
-                ((glyph * 255 / total) as u8, 0xf2, 0xf2, 0xf2)
-            };
-            data.extend_from_slice(&[a, r, g, b]);
-        }
-    }
+    // Panels are dark on GNOME: a light mark.
+    let rgba = crate::brand::mark_rgba(size, [0xf2, 0xf2, 0xf2], badge);
     ksni::Icon {
         width: size as i32,
         height: size as i32,
-        data,
+        // ARGB32, network byte order.
+        data: rgba
+            .chunks(4)
+            .flat_map(|p| [p[3], p[0], p[1], p[2]])
+            .collect(),
     }
-}
-
-/// RGBA pixels of the app icon, for the window icon.
-pub fn icon_rgba(size: usize) -> Vec<u8> {
-    render_icon(size, None)
-        .data
-        .chunks(4)
-        .flat_map(|p| [p[1], p[2], p[3], p[0]])
-        .collect()
 }
 
 #[cfg(test)]
