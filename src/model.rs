@@ -152,8 +152,8 @@ impl Task {
     }
 
     /// A task is "running" while its remote item is open. The store refuses
-    /// to archive or delete a running task, because the next sync would bring
-    /// it back.
+    /// to delete a running task, because the next sync would bring it back.
+    /// Archiving is fine: the task comes back to Active on new activity.
     pub fn is_running(&self) -> bool {
         matches!(&self.origin, Origin::Remote(r) if r.state == RemoteState::Open)
     }
@@ -478,16 +478,14 @@ impl Store {
         Ok(true)
     }
 
-    /// Any rung -> Archived. Refused while the remote item is open.
+    /// Any rung -> Archived. Works for open remote items too, so a stale pull
+    /// request can be put away until something happens on it.
     pub fn archive(&mut self, id: &str) -> Result<bool, String> {
         let Some(t) = self.get_mut(id) else {
             return Ok(false);
         };
         if t.state == TaskState::Archived {
             return Ok(false);
-        }
-        if t.is_running() {
-            return Err(running_message(t, "archive"));
         }
         t.state = TaskState::Archived;
         t.updated_at = Utc::now();
@@ -512,10 +510,11 @@ impl Store {
     /// Active tasks. Tracked items follow their remote state:
     ///
     /// * open -> closed or merged: an Active task settles on its own
-    /// * closed -> open: a non-archived task reopens at the top of Active
-    /// * open with newer activity: a Settled task wakes into Active
+    /// * closed -> open: a Settled or Archived task reopens at the top of Active
+    /// * open with newer activity: a Settled or Archived task wakes into Active
     ///
-    /// Archived tasks only get their remote fields refreshed.
+    /// Archived tasks wake like settled ones, so archiving a stale open item
+    /// puts it away only until something happens on it.
     pub fn apply_remote(&mut self, items: &[RemoteItem]) -> Vec<SyncEvent> {
         let mut events = Vec::new();
         let now = Utc::now();
@@ -565,7 +564,7 @@ impl Store {
             let label = item.r.label();
             if !was_open && is_open {
                 match t.state {
-                    TaskState::Settled => {
+                    TaskState::Settled | TaskState::Archived => {
                         t.state = TaskState::Active;
                         t.reopened = true;
                         t.pinned = false;
@@ -579,7 +578,6 @@ impl Store {
                         changed = true;
                         events.push(SyncEvent::ReopenedRemotely { id: key, label });
                     }
-                    TaskState::Archived => {}
                 }
             } else if was_open && !is_open {
                 if t.state == TaskState::Active {
@@ -610,7 +608,7 @@ impl Store {
             } else if is_open
                 && !old.in_queries
                 && item.r.in_queries
-                && t.state == TaskState::Settled
+                && t.state != TaskState::Active
             {
                 t.state = TaskState::Active;
                 t.reopened = true;
@@ -619,7 +617,7 @@ impl Store {
                 events.push(SyncEvent::Requested { id: key, label });
             } else if is_open
                 && item.r.remote_updated_at > old.remote_updated_at
-                && t.state == TaskState::Settled
+                && t.state != TaskState::Active
             {
                 t.state = TaskState::Active;
                 t.reopened = true;
@@ -767,18 +765,55 @@ mod tests {
     }
 
     #[test]
-    fn store_refuses_to_archive_or_delete_an_open_remote_item() {
+    fn store_refuses_to_delete_an_open_remote_item() {
         let mut s = Store::in_memory();
         let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
         assert!(matches!(ev.as_slice(), [SyncEvent::New { .. }]));
         let id = s.tasks()[0].id.clone();
-        assert!(s.archive(&id).is_err());
         assert!(s.delete(&id).is_err());
         assert_eq!(s.settle(&id), Ok(true));
-        assert!(s.archive(&id).is_err());
+        assert!(s.delete(&id).is_err());
         s.apply_remote(&[remote(1, RemoteState::Merged, t0())]);
-        assert_eq!(s.archive(&id), Ok(true));
         assert_eq!(s.delete(&id), Ok(true));
+    }
+
+    #[test]
+    fn a_stale_open_item_can_be_archived_until_it_moves_again() {
+        let mut s = Store::in_memory();
+        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        assert_eq!(s.archive(&id), Ok(true));
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
+        // No activity: stays archived, even after leaving the queries.
+        let mut quiet = remote(1, RemoteState::Open, t0());
+        quiet.r.in_queries = false;
+        assert!(s.apply_remote(&[quiet.clone()]).is_empty());
+        assert!(s.apply_remote(&[quiet]).is_empty());
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
+        // Still cannot delete while open.
+        assert!(s.delete(&id).is_err());
+        // Someone pushes: it comes back to the top of Active.
+        let mut pushed = remote(1, RemoteState::Open, t0() + Duration::minutes(1));
+        pushed.r.in_queries = false;
+        let ev = s.apply_remote(&[pushed]);
+        assert!(matches!(ev.as_slice(), [SyncEvent::Woken { .. }]));
+        let t = s.get(&id).unwrap();
+        assert_eq!(t.rung(), Rung::Active);
+        assert!(t.reopened && t.unseen);
+    }
+
+    #[test]
+    fn a_review_requested_again_wakes_an_archived_task() {
+        let mut s = Store::in_memory();
+        s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        let mut out = remote(1, RemoteState::Open, t0());
+        out.r.in_queries = false;
+        s.apply_remote(&[out]);
+        s.archive(&id).unwrap();
+        let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
+        assert!(matches!(ev.as_slice(), [SyncEvent::Requested { .. }]));
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
     }
 
     #[test]
@@ -798,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_activity_wakes_a_settled_task_but_not_an_archived_one() {
+    fn remote_activity_wakes_settled_and_archived_tasks() {
         let mut s = Store::in_memory();
         s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
@@ -815,12 +850,15 @@ mod tests {
         assert!(ev.is_empty());
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
 
-        // Archived tasks stay archived on remote reopen.
+        // An archived task comes back when the item is reopened.
         s.apply_remote(&[remote(1, RemoteState::Closed, t0() + Duration::minutes(2))]);
         s.archive(&id).unwrap();
         let ev = s.apply_remote(&[remote(1, RemoteState::Open, t0() + Duration::minutes(3))]);
-        assert!(ev.is_empty());
-        assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
+        assert!(matches!(
+            ev.as_slice(),
+            [SyncEvent::ReopenedRemotely { .. }]
+        ));
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
     }
 
     #[test]

@@ -145,25 +145,26 @@ Where a row shows, evaluated in order: archived, then pinned, then the state.
   does nothing.
 - **Reopen** moves the task to the top of Active. It never restores a pin.
 - **Archive** keeps everything else as it is. Archiving an archived task does
-  nothing.
+  nothing. An archived task with an open remote item wakes on new activity.
 - **Delete** asks first. Enter confirms, Escape or the backdrop cancels. While
   the dialog is open, no other keys do anything.
 
-A task whose remote item is open is "running". The store refuses to archive or
-delete a running task and shows the reason as a notice. Settle it instead.
-Once the item is closed or merged, archive and delete work.
+A task whose remote item is open is "running". Running tasks can be settled
+and archived, so a stale pull request can be put away. It comes back to
+Active as soon as something happens on it. Running tasks cannot be deleted,
+since the next sync would bring the item back; the store shows that as a
+notice. Once the item is closed or merged, delete works too.
 
 Sync applies these rules to tracked items:
 
 - open, not tracked: new Active task
 - open to closed or merged: an Active task settles
-- closed to open: a Settled task reopens at the top of Active
+- closed to open: a Settled or Archived task reopens at the top of Active
 - open but no longer in any of your queries, for example after you submit
   a review: an Active task settles. Pinned tasks stay.
-- back in your queries, for example a review requested again: a Settled
-  task wakes into Active
-- open with newer activity: a Settled task wakes into Active
-- archived tasks only refresh their remote fields
+- back in your queries, for example a review requested again: a Settled or
+  Archived task wakes into Active
+- open with newer activity: a Settled or Archived task wakes into Active
 
 After archive or delete, selection moves to the newest unarchived task in the
 same project, or to nothing.
