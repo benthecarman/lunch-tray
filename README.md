@@ -137,10 +137,9 @@ Tasks are stored in `~/.local/share/lunch-tray/tasks.json`.
 ## The state machine
 
 A task has one `state` field: `active`, `settled`, or `archived`. Deleted
-tasks are removed from the file. Two more fields shape the view:
-
-- `pinned` puts an active task in the Pinned section.
-- `reopened` sorts a task to the top of Active. Settle clears it.
+tasks are removed from the file. A `pinned` flag puts an active task in the
+Pinned section. Every section sorts by last activity, newest first: the
+remote item's update time, or the task's own for manual ones.
 
 Where a row shows, evaluated in order: archived, then pinned, then the state.
 
@@ -150,9 +149,8 @@ Where a row shows, evaluated in order: archived, then pinned, then the state.
 | Settled | Archive | Rename, Reopen, Archive, Delete |
 | Archived | Delete | Rename, Reopen, Delete |
 
-- **Settle** drops the pin and the reopened marker. Settling a settled task
-  does nothing.
-- **Reopen** moves the task to the top of Active. It never restores a pin.
+- **Settle** drops the pin. Settling a settled task does nothing.
+- **Reopen** moves the task back to Active. It never restores a pin.
 - **Archive** keeps everything else as it is. Archiving an archived task does
   nothing. An archived task with an open remote item wakes on new activity.
 - **Archive older than a year**, in the window menu, archives every unpinned
@@ -171,7 +169,7 @@ Sync applies these rules to tracked items:
 
 - open, not tracked: new Active task
 - open to closed or merged: an Active task settles
-- closed to open: a Settled or Archived task reopens at the top of Active
+- closed to open: a Settled or Archived task reopens
 - open but no longer in any of your queries, for example after you submit
   a review: an Active task settles. Pinned tasks stay.
 - back in your queries, for example a review requested again: a Settled or

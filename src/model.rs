@@ -2,7 +2,7 @@
 //!
 //! A task has one `state` field with three values: `Active`, `Settled`, and
 //! `Archived`. Deleted tasks are removed from the store. `pinned` is a view
-//! flag, and `reopened` only affects ordering inside the Active section.
+//! flag. Every section sorts by the task's last activity, newest first.
 
 use std::path::{Path, PathBuf};
 
@@ -134,8 +134,6 @@ pub struct Task {
     pub state: TaskState,
     #[serde(default)]
     pub pinned: bool,
-    #[serde(default)]
-    pub reopened: bool,
     #[serde(default)]
     pub unseen: bool,
     pub created_at: DateTime<Utc>,
@@ -330,10 +328,9 @@ impl Store {
                 Rung::Settled => s.settled.push(t.clone()),
             }
         }
-        let newest = |a: &Task, b: &Task| b.updated_at.cmp(&a.updated_at);
+        let newest = |a: &Task, b: &Task| Self::last_activity(b).cmp(&Self::last_activity(a));
         s.pinned.sort_by(newest);
-        s.active
-            .sort_by(|a, b| b.reopened.cmp(&a.reopened).then_with(|| newest(a, b)));
+        s.active.sort_by(newest);
         s.settled.sort_by(newest);
         s.archived.sort_by(newest);
         s
@@ -413,7 +410,6 @@ impl Store {
             project: LOCAL_PROJECT.to_string(),
             state: TaskState::Active,
             pinned: false,
-            reopened: false,
             unseen: false,
             created_at: now,
             updated_at: now,
@@ -485,7 +481,7 @@ impl Store {
         Ok(true)
     }
 
-    /// Active -> Settled. Drops the pin and the reopened marker.
+    /// Active -> Settled. Drops the pin.
     pub fn settle(&mut self, id: &str) -> Result<bool, String> {
         let Some(t) = self.get_mut(id) else {
             return Ok(false);
@@ -495,14 +491,12 @@ impl Store {
         }
         t.state = TaskState::Settled;
         t.pinned = false;
-        t.reopened = false;
         t.unseen = false;
         t.updated_at = Utc::now();
         Ok(true)
     }
 
-    /// Settled or Archived -> Active. The task lands at the top of Active and
-    /// never comes back pinned.
+    /// Settled or Archived -> Active. The task never comes back pinned.
     pub fn reopen(&mut self, id: &str) -> Result<bool, String> {
         let Some(t) = self.get_mut(id) else {
             return Ok(false);
@@ -511,7 +505,6 @@ impl Store {
             return Ok(false);
         }
         t.state = TaskState::Active;
-        t.reopened = true;
         t.pinned = false;
         t.updated_at = Utc::now();
         Ok(true)
@@ -570,7 +563,6 @@ impl Store {
                         project: item.r.project(),
                         state: TaskState::Active,
                         pinned: false,
-                        reopened: false,
                         unseen: true,
                         created_at: now,
                         updated_at: now,
@@ -605,7 +597,6 @@ impl Store {
                 match t.state {
                     TaskState::Settled | TaskState::Archived => {
                         t.state = TaskState::Active;
-                        t.reopened = true;
                         t.pinned = false;
                         t.unseen = true;
                         changed = true;
@@ -622,7 +613,6 @@ impl Store {
                 if t.state == TaskState::Active {
                     t.state = TaskState::Settled;
                     t.pinned = false;
-                    t.reopened = false;
                     changed = true;
                 }
                 t.unseen = false;
@@ -640,7 +630,6 @@ impl Store {
                 // Left your queries, for example after you submitted the
                 // review. Pinned tasks are yours to settle.
                 t.state = TaskState::Settled;
-                t.reopened = false;
                 t.unseen = false;
                 changed = true;
                 events.push(SyncEvent::Released { id: key, label });
@@ -650,7 +639,6 @@ impl Store {
                 && t.state != TaskState::Active
             {
                 t.state = TaskState::Active;
-                t.reopened = true;
                 t.unseen = true;
                 changed = true;
                 events.push(SyncEvent::Requested { id: key, label });
@@ -659,7 +647,6 @@ impl Store {
                 && t.state != TaskState::Active
             {
                 t.state = TaskState::Active;
-                t.reopened = true;
                 t.unseen = true;
                 changed = true;
                 events.push(SyncEvent::Woken { id: key, label });
@@ -788,19 +775,38 @@ mod tests {
     }
 
     #[test]
-    fn reopened_tasks_sort_first_in_active() {
+    fn every_section_sorts_by_last_activity() {
         let mut s = Store::in_memory();
-        let old = s.add_manual("old", "", None);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let newer = s.add_manual("newer", "", None);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let newest = s.add_manual("newest", "", None);
-        s.settle(&old).unwrap();
-        s.reopen(&old).unwrap();
-        let ids: Vec<_> = s.sections().active.iter().map(|t| t.id.clone()).collect();
-        assert_eq!(ids, vec![old.clone(), newest, newer]);
-        s.settle(&old).unwrap();
-        assert!(!s.get(&old).unwrap().reopened);
+        s.apply_remote(&[
+            remote(1, RemoteState::Open, t0() + Duration::hours(1)),
+            remote(2, RemoteState::Open, t0() + Duration::hours(3)),
+            remote(3, RemoteState::Open, t0() + Duration::hours(2)),
+        ]);
+        let ids: Vec<String> = s.tasks().iter().map(|t| t.id.clone()).collect();
+        let order = |s: &Store| -> Vec<String> {
+            s.sections().active.iter().map(|t| t.id.clone()).collect()
+        };
+        assert_eq!(
+            order(&s),
+            vec![ids[1].clone(), ids[2].clone(), ids[0].clone()]
+        );
+        // Settling and reopening does not move a task; remote activity does.
+        s.settle(&ids[1]).unwrap();
+        s.reopen(&ids[1]).unwrap();
+        assert_eq!(
+            order(&s),
+            vec![ids[1].clone(), ids[2].clone(), ids[0].clone()]
+        );
+        s.apply_remote(&[remote(1, RemoteState::Open, t0() + Duration::hours(4))]);
+        assert_eq!(
+            order(&s),
+            vec![ids[0].clone(), ids[1].clone(), ids[2].clone()]
+        );
+        // Settled sorts the same way.
+        s.settle(&ids[0]).unwrap();
+        s.settle(&ids[2]).unwrap();
+        let settled: Vec<String> = s.sections().settled.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(settled, vec![ids[0].clone(), ids[2].clone()]);
     }
 
     #[test]
@@ -838,7 +844,7 @@ mod tests {
         assert!(matches!(ev.as_slice(), [SyncEvent::Woken { .. }]));
         let t = s.get(&id).unwrap();
         assert_eq!(t.rung(), Rung::Active);
-        assert!(t.reopened && t.unseen);
+        assert!(t.unseen);
     }
 
     #[test]
@@ -881,7 +887,6 @@ mod tests {
         assert!(matches!(ev.as_slice(), [SyncEvent::Woken { .. }]));
         let t = s.get(&id).unwrap();
         assert_eq!(t.rung(), Rung::Active);
-        assert!(t.reopened);
 
         // Same timestamp: no wake.
         s.settle(&id).unwrap();
@@ -901,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn remotely_reopened_item_lands_at_top_of_active() {
+    fn remotely_reopened_item_becomes_active_again() {
         let mut s = Store::in_memory();
         s.apply_remote(&[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
@@ -912,7 +917,7 @@ mod tests {
             ev.as_slice(),
             [SyncEvent::ReopenedRemotely { .. }]
         ));
-        assert!(s.get(&id).unwrap().reopened);
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
     }
 
     #[test]
@@ -989,7 +994,7 @@ mod tests {
         assert!(matches!(ev.as_slice(), [SyncEvent::Requested { .. }]));
         let t = s.get(&id).unwrap();
         assert_eq!(t.rung(), Rung::Active);
-        assert!(t.reopened && t.unseen);
+        assert!(t.unseen);
     }
 
     #[test]
