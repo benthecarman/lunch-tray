@@ -178,16 +178,14 @@ Sync applies these rules to tracked items:
   Archived task wakes into Active
 - open with newer activity: a Settled or Archived task wakes into Active
 
-After archive or delete, selection moves to the newest unarchived task in the
-same project, or to nothing.
-
 ## Keys
+
+Click a row to open its pull request or issue in the browser. A note with a
+link opens the link; one without opens its editor. Hover a row for its
+actions.
 
 | Key | Action |
 |---|---|
-| Up, Down | Move selection |
-| Enter | Open the selected task's link |
-| Delete | Delete the selected task, after confirmation |
 | Escape | Close the popover |
 
 ## Development
