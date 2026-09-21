@@ -116,6 +116,10 @@ pub struct App {
     menu_row: Option<String>,
     /// The tray mark, white, tinted where it is drawn.
     mark: egui::TextureHandle,
+    /// Current search text. Empty shows everything.
+    search: String,
+    /// Give the search field focus on the next frame.
+    focus_search: bool,
     /// The popover closes when it loses focus, once it had focus and the
     /// pointer has been inside it.
     was_focused: bool,
@@ -135,6 +139,7 @@ struct Frame {
     sync_errors: Vec<String>,
     theme: ThemePref,
     show_archived: bool,
+    searching: bool,
 }
 
 impl App {
@@ -160,6 +165,8 @@ impl App {
             collapsed: HashSet::new(),
             menu_row: None,
             mark,
+            search: String::new(),
+            focus_search: false,
             was_focused: false,
             armed: false,
             last_focus: None,
@@ -322,7 +329,17 @@ impl App {
         if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
-        if self.mode == WindowMode::Popover && ctx.input(|i| i.key_pressed(Key::Escape)) {
+        let (slash, ctrl_f, escape) = ctx.input(|i| {
+            (
+                i.key_pressed(Key::Slash),
+                i.modifiers.command && i.key_pressed(Key::F),
+                i.key_pressed(Key::Escape),
+            )
+        });
+        if slash || ctrl_f {
+            self.focus_search = true;
+        }
+        if escape && self.mode == WindowMode::Popover {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
@@ -417,14 +434,28 @@ impl eframe::App for App {
                 };
                 now.duration_since(n.at) < ttl
             });
+            let mut sections = s.store.sections();
+            let query = self.search.trim().to_string();
+            if !query.is_empty() {
+                for list in [
+                    &mut sections.pinned,
+                    &mut sections.active,
+                    &mut sections.settled,
+                    &mut sections.archived,
+                ] {
+                    list.retain(|t| t.matches(&query));
+                }
+            }
             let f = Frame {
-                sections: s.store.sections(),
+                sections,
                 notices: s.notices.clone(),
                 syncing: s.sync.in_progress,
                 last_sync: s.sync.last_finished,
                 sync_errors: s.sync.errors.clone(),
                 theme: pref,
-                show_archived: s.store.settings().show_archived,
+                // A search looks everywhere, archive included.
+                show_archived: s.store.settings().show_archived || !query.is_empty(),
+                searching: !query.is_empty(),
             };
             drop(s);
             self.apply_theme(ctx, pref, system);
@@ -494,6 +525,8 @@ impl eframe::App for App {
             .frame(panel_frame(Margin::symmetric(12, 10)))
             .show(root, |ui| {
                 self.header(ui, &p, &frame);
+                ui.add_space(6.0);
+                self.search_bar(ui, &p);
             });
 
         egui::Panel::bottom("bottom")
@@ -591,6 +624,34 @@ impl App {
                 ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
             }
         }
+    }
+
+    /// A search field spanning the window. `/` or Ctrl+F focus it.
+    fn search_bar(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let clear_w = if self.search.is_empty() { 0.0 } else { 34.0 };
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .id(Id::new("search"))
+                    .hint_text(format!(
+                        "{}  Search by org, repo, title, or number",
+                        icons::MAGNIFYING_GLASS
+                    ))
+                    .desired_width(ui.available_width() - clear_w)
+                    .margin(Margin::symmetric(10, 6)),
+            );
+            if std::mem::take(&mut self.focus_search) {
+                field.request_focus();
+            }
+            if field.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                self.search.clear();
+            }
+            if !self.search.is_empty() && icon_button(ui, icons::X, "Clear search").clicked() {
+                self.search.clear();
+            }
+        });
+        let _ = p;
     }
 
     fn app_menu(&mut self, ui: &mut egui::Ui, p: &Palette, frame: &Frame) {
@@ -750,7 +811,7 @@ impl App {
     ) {
         let popover = self.mode == WindowMode::Popover;
         let s = &frame.sections;
-        let shown = if popover {
+        let shown = if popover && !frame.searching {
             s.pinned.len() + s.active.len()
         } else {
             s.pinned.len() + s.active.len() + s.settled.len() + s.archived.len()
@@ -758,6 +819,21 @@ impl App {
         if shown == 0 {
             ui.add_space(56.0);
             ui.vertical_centered(|ui| {
+                if frame.searching {
+                    ui.label(
+                        RichText::new(icons::MAGNIFYING_GLASS)
+                            .size(40.0)
+                            .color(p.text_weak),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("No matches").text_style(title_style()));
+                    ui.label(
+                        RichText::new("Try an org, a repo, a word from the title, or a number.")
+                            .text_style(TextStyle::Small)
+                            .color(p.text_weak),
+                    );
+                    return;
+                }
                 ui.add(egui::Image::new((self.mark.id(), Vec2::splat(48.0))).tint(p.text_weak));
                 ui.add_space(6.0);
                 ui.label(RichText::new("Nothing on your tray").text_style(title_style()));
@@ -779,7 +855,7 @@ impl App {
         let mut next_menu_row: Option<String> = None;
         let mut sections: Vec<(&'static str, &Vec<Task>)> =
             vec![("Pinned", &s.pinned), ("Active", &s.active)];
-        if !popover {
+        if !popover || frame.searching {
             sections.push(("Settled", &s.settled));
             if frame.show_archived {
                 sections.push(("Archived", &s.archived));

@@ -185,9 +185,14 @@ Click a row to open its pull request or issue in the browser. A note with a
 link opens the link; one without opens its editor. Hover a row for its
 actions.
 
+The search field under the header filters every section by org, repo, title,
+or number. Each word must match somewhere, so `ldk 291` finds ldk-server
+#291. A search also looks through the archive.
+
 | Key | Action |
 |---|---|
-| Escape | Close the popover |
+| `/` or Ctrl+F | Focus the search field |
+| Escape | Clear the search, then close the popover |
 
 ## Development
 

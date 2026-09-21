@@ -78,11 +78,12 @@ pub fn mark_rgba(size: usize, rgb: [u8; 3], badge: Option<[u8; 3]>) -> Vec<u8> {
     out
 }
 
-const ICON_BG: [u8; 3] = [0xe9, 0xed, 0xe8];
-const ICON_EDGE: [u8; 3] = [0xc4, 0xcb, 0xc6];
-const ICON_INK: [u8; 3] = [0x18, 0x21, 0x1c];
+// The dark tray palette: slate tile, mint mark.
+const ICON_BG: [u8; 3] = [0x1d, 0x23, 0x20];
+const ICON_EDGE: [u8; 3] = [0x3f, 0x49, 0x43];
+const ICON_INK: [u8; 3] = [0xe9, 0xed, 0xe8];
 
-/// The launcher icon: the mark in ink on a rounded tray-colored tile.
+/// The launcher icon: the mint mark on a rounded slate tile.
 pub fn app_icon_rgba(size: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(size * size * 4);
     let tile = |px: f32, py: f32| sd_round_rect(px - 0.5, py - 0.5, 0.47, 0.11) <= 0.0;
@@ -180,11 +181,11 @@ mod tests {
         let icon = app_icon_rgba(64);
         let ink = icon
             .chunks(4)
-            .filter(|p| p[0] == 0x18 && p[3] == 255)
+            .filter(|p| p[0] == 0xe9 && p[3] == 255)
             .count();
         let bg = icon
             .chunks(4)
-            .filter(|p| p[0] == 0xe9 && p[3] == 255)
+            .filter(|p| p[0] == 0x1d && p[3] == 255)
             .count();
         assert!(ink > 100 && bg > 1000, "ink {ink} bg {bg}");
         // Corners are transparent.
@@ -199,7 +200,7 @@ mod tests {
             .filter(|y| {
                 (0..size).any(|x| {
                     let i = (y * size + x) * 4;
-                    icon[i] == 0x18 && icon[i + 3] == 255
+                    icon[i] == 0xe9 && icon[i + 3] == 255
                 })
             })
             .collect();
@@ -216,6 +217,6 @@ mod tests {
         let svg = app_icon_svg();
         assert!(svg.starts_with("<svg"));
         assert!(svg.trim_end().ends_with("</svg>"));
-        assert!(svg.contains("#18211c"));
+        assert!(svg.contains("#e9ede8") && svg.contains("#1d2320"));
     }
 }

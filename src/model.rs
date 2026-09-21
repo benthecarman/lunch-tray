@@ -175,6 +175,28 @@ impl Task {
         }
     }
 
+    /// Every whitespace-separated word of `query` must match the title, the
+    /// owner, the repository, or the number. Case does not matter, and a
+    /// leading `#` on a number is fine.
+    pub fn matches(&self, query: &str) -> bool {
+        let title = self.title.to_lowercase();
+        let (owner, repo, number) = match &self.origin {
+            Origin::Remote(r) => (
+                r.owner.to_lowercase(),
+                r.repo.to_lowercase(),
+                r.number.to_string(),
+            ),
+            Origin::Manual => (String::new(), String::new(), String::new()),
+        };
+        query.split_whitespace().map(|w| w.to_lowercase()).all(|w| {
+            let n = w.trim_start_matches('#');
+            title.contains(&w)
+                || owner.contains(&w)
+                || repo.contains(&w)
+                || (!n.is_empty() && number == n)
+        })
+    }
+
     pub fn rung(&self) -> Rung {
         // Evaluated in order: archived, then pinned, then the state field.
         match self.state {
@@ -1123,6 +1145,26 @@ mod tests {
             &[remote(2, RemoteState::Open, t0() + Duration::minutes(1))],
         );
         assert_eq!(s.get(&ids[1]).unwrap().rung(), Rung::Active);
+    }
+
+    #[test]
+    fn search_matches_title_owner_repo_and_number() {
+        let mut s = Store::in_memory();
+        let mut item = remote(989, RemoteState::Open, t0());
+        item.title = "Give sidebar tasks one ladder".into();
+        s.apply_remote(OnClose::Settle, &[item]);
+        let note = s.add_manual("Write the README", "", None);
+        let pr = s.tasks()[0].clone();
+        let note = s.get(&note).unwrap().clone();
+        assert!(pr.matches("ladder"));
+        assert!(pr.matches("Octo"));
+        assert!(pr.matches("cat 989"));
+        assert!(pr.matches("#989"));
+        assert!(!pr.matches("98"));
+        assert!(!pr.matches("readme"));
+        assert!(note.matches("readme"));
+        assert!(!note.matches("octo"));
+        assert!(pr.matches(""));
     }
 
     #[test]
