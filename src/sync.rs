@@ -10,12 +10,19 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::config::{Config, ForgejoAccount, GithubAccount, is_excluded};
-use crate::model::{OnClose, Provider, RemoteItem, RemoteKind, RemoteRef, RemoteState, SyncEvent};
+use crate::model::{
+    Checks, MergeState, OnClose, Provider, RemoteItem, RemoteKind, RemoteRef, RemoteState,
+    SyncEvent,
+};
 use crate::shared::{Notice, SharedRef};
 
 const USER_AGENT: &str = concat!("lunch-tray/", env!("CARGO_PKG_VERSION"));
 const MAX_PAGES: usize = 5;
 const MAX_INDIVIDUAL_CHECKS: usize = 60;
+/// Pull requests per GraphQL request.
+const GRAPHQL_BATCH: usize = 50;
+/// Forgejo needs two calls per pull request; cap each poll.
+const FORGEJO_CHECKS_PER_POLL: usize = 20;
 
 pub enum SyncCmd {
     Now,
@@ -31,6 +38,28 @@ pub trait Forge: Send {
     fn fetch_one(&self, owner: &str, repo: &str, number: u64) -> Result<RemoteItem>;
     /// Repository patterns to ignore.
     fn exclude(&self) -> &[String];
+    /// CI and merge state for these open pull requests. Items the forge
+    /// cannot answer for are simply left out.
+    fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>>;
+}
+
+/// Sort CI contexts into passed, failed, or pending buckets.
+fn tally(states: impl IntoIterator<Item = CheckOutcome>) -> (u32, u32, u32) {
+    let (mut passed, mut failed, mut pending) = (0, 0, 0);
+    for s in states {
+        match s {
+            CheckOutcome::Passed => passed += 1,
+            CheckOutcome::Failed => failed += 1,
+            CheckOutcome::Pending => pending += 1,
+        }
+    }
+    (passed, failed, pending)
+}
+
+enum CheckOutcome {
+    Passed,
+    Failed,
+    Pending,
 }
 
 /// One HTTP client per account. Error statuses come back as responses so
@@ -63,20 +92,53 @@ impl Http {
         url: &str,
         headers: &[(&str, String)],
     ) -> Result<T> {
+        self.request_json(url, headers, None)
+    }
+
+    /// POST a JSON body and decode the JSON reply.
+    fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        body: &serde_json::Value,
+    ) -> Result<T> {
+        self.request_json(url, headers, Some(body))
+    }
+
+    fn request_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        body: Option<&serde_json::Value>,
+    ) -> Result<T> {
         for attempt in 0..2 {
-            let mut req = self.agent.get(url);
-            for (k, v) in headers {
-                req = req.header(*k, v);
-            }
             let cookie = self
                 .gate_cookie
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            if let Some(c) = &cookie {
-                req = req.header("Cookie", c);
-            }
-            let mut resp = req.call().with_context(|| format!("GET {url}"))?;
+            let mut resp = match body {
+                None => {
+                    let mut req = self.agent.get(url);
+                    for (k, v) in headers {
+                        req = req.header(*k, v);
+                    }
+                    if let Some(c) = &cookie {
+                        req = req.header("Cookie", c);
+                    }
+                    req.call().with_context(|| format!("GET {url}"))?
+                }
+                Some(body) => {
+                    let mut req = self.agent.post(url);
+                    for (k, v) in headers {
+                        req = req.header(*k, v);
+                    }
+                    if let Some(c) = &cookie {
+                        req = req.header("Cookie", c);
+                    }
+                    req.send_json(body).with_context(|| format!("POST {url}"))?
+                }
+            };
             let status = resp.status().as_u16();
             let html = resp
                 .headers()
@@ -227,6 +289,14 @@ pub struct GitHub {
 }
 
 impl GitHub {
+    /// The GraphQL endpoint next to the REST one.
+    fn graphql_url(&self) -> String {
+        match self.api_url.strip_suffix("/api/v3") {
+            Some(base) => format!("{base}/api/graphql"),
+            None => format!("{}/graphql", self.api_url),
+        }
+    }
+
     pub fn new(acc: &GithubAccount) -> Result<Self> {
         Ok(GitHub {
             api_url: acc.api_url.trim_end_matches('/').to_string(),
@@ -288,6 +358,7 @@ impl GitHub {
                 draft: it.draft,
                 remote_updated_at: parse_time(&it.updated_at),
                 in_queries: true,
+                checks: None,
             },
             title: it.title,
         })
@@ -336,6 +407,58 @@ impl Forge for GitHub {
         &self.exclude
     }
 
+    /// One GraphQL request per `GRAPHQL_BATCH` pull requests: each alias
+    /// asks for the merge state and the check rollup of the head commit.
+    fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>> {
+        let mut out = Vec::new();
+        for batch in prs.chunks(GRAPHQL_BATCH) {
+            let mut query = String::from("query {");
+            for (i, r) in batch.iter().enumerate() {
+                query.push_str(&format!(
+                    " p{i}: repository(owner: {owner}, name: {repo}) {{ pullRequest(number: {n}) {{ ...pr }} }}",
+                    owner = serde_json::to_string(&r.owner)?,
+                    repo = serde_json::to_string(&r.repo)?,
+                    n = r.number
+                ));
+            }
+            query.push_str(
+                " } fragment pr on PullRequest { headRefOid mergeable mergeStateStatus \
+                 commits(last: 1) { nodes { commit { statusCheckRollup { state \
+                 contexts(first: 100) { totalCount nodes { __typename \
+                 ... on CheckRun { status conclusion } ... on StatusContext { state } } } } } } } }",
+            );
+            let reply: GqlReply = self.http.post_json(
+                &self.graphql_url(),
+                &[("Authorization", format!("Bearer {}", self.token))],
+                &serde_json::json!({ "query": query }),
+            )?;
+            if let Some(errors) = &reply.errors {
+                for e in errors {
+                    log::debug!("graphql: {}", e.message);
+                }
+            }
+            let Some(data) = reply.data else {
+                continue;
+            };
+            let now = Utc::now();
+            for (i, r) in batch.iter().enumerate() {
+                let node = data
+                    .get(format!("p{i}"))
+                    .and_then(|v| v.get("pullRequest"))
+                    .cloned()
+                    .filter(|v| !v.is_null());
+                let Some(node) = node else {
+                    continue;
+                };
+                match serde_json::from_value::<GqlPr>(node) {
+                    Ok(pr) => out.push((r.key(), pr.into_checks(now))),
+                    Err(e) => log::warn!("checks for {}: {e}", r.label()),
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn fetch_open(&self) -> Result<Vec<RemoteItem>> {
         let mut out = Vec::new();
         for q in &self.queries {
@@ -361,6 +484,129 @@ impl Forge for GitHub {
         let url = format!("{}/repos/{owner}/{repo}/issues/{number}", self.api_url);
         let it: GhIssue = self.get(&url)?;
         self.convert(it).context("unexpected item shape")
+    }
+}
+
+#[derive(Deserialize)]
+struct GqlReply {
+    data: Option<serde_json::Value>,
+    errors: Option<Vec<GqlError>>,
+}
+
+#[derive(Deserialize)]
+struct GqlError {
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPr {
+    head_ref_oid: String,
+    mergeable: String,
+    merge_state_status: Option<String>,
+    commits: GqlCommits,
+}
+
+#[derive(Deserialize)]
+struct GqlCommits {
+    nodes: Vec<GqlCommitNode>,
+}
+
+#[derive(Deserialize)]
+struct GqlCommitNode {
+    commit: GqlCommit,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlCommit {
+    status_check_rollup: Option<GqlRollup>,
+}
+
+#[derive(Deserialize)]
+struct GqlRollup {
+    contexts: GqlContexts,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlContexts {
+    total_count: u32,
+    nodes: Vec<GqlContext>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum GqlContext {
+    CheckRun {
+        status: String,
+        conclusion: Option<String>,
+    },
+    StatusContext {
+        state: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+impl GqlContext {
+    fn outcome(&self) -> CheckOutcome {
+        match self {
+            GqlContext::CheckRun { status, conclusion } => {
+                if status != "COMPLETED" {
+                    return CheckOutcome::Pending;
+                }
+                match conclusion.as_deref() {
+                    Some("SUCCESS" | "NEUTRAL" | "SKIPPED") => CheckOutcome::Passed,
+                    None => CheckOutcome::Pending,
+                    Some(_) => CheckOutcome::Failed,
+                }
+            }
+            GqlContext::StatusContext { state } => match state.as_str() {
+                "SUCCESS" => CheckOutcome::Passed,
+                "PENDING" | "EXPECTED" => CheckOutcome::Pending,
+                _ => CheckOutcome::Failed,
+            },
+            GqlContext::Other => CheckOutcome::Passed,
+        }
+    }
+}
+
+impl GqlPr {
+    fn into_checks(self, now: chrono::DateTime<Utc>) -> Checks {
+        let merge = match (
+            self.mergeable.as_str(),
+            self.merge_state_status.as_deref().unwrap_or("UNKNOWN"),
+        ) {
+            ("CONFLICTING", _) | (_, "DIRTY") => MergeState::Conflicting,
+            ("UNKNOWN", _) | (_, "UNKNOWN") => MergeState::Unknown,
+            (_, "BEHIND") => MergeState::Behind,
+            (_, "BLOCKED") => MergeState::Blocked,
+            (_, "UNSTABLE") => MergeState::Unstable,
+            _ => MergeState::Clean,
+        };
+        let rollup = self
+            .commits
+            .nodes
+            .into_iter()
+            .next()
+            .and_then(|n| n.commit.status_check_rollup);
+        let (passed, failed, pending, total) = match rollup {
+            Some(r) => {
+                let (p, f, pe) = tally(r.contexts.nodes.iter().map(GqlContext::outcome));
+                (p, f, pe, r.contexts.total_count.max(p + f + pe))
+            }
+            None => (0, 0, 0, 0),
+        };
+        Checks {
+            passed,
+            failed,
+            pending,
+            total,
+            merge,
+            head_sha: self.head_ref_oid,
+            checked_at: now,
+        }
     }
 }
 
@@ -445,6 +691,7 @@ impl Forgejo {
                 draft,
                 remote_updated_at: parse_time(&it.updated_at),
                 in_queries: true,
+                checks: None,
             },
             title: it.title,
         }
@@ -475,6 +722,29 @@ struct FjUser {
 }
 
 #[derive(Deserialize)]
+struct FjPull {
+    mergeable: Option<bool>,
+    head: FjHead,
+}
+
+#[derive(Deserialize)]
+struct FjHead {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct FjCombinedStatus {
+    /// Forgejo sends `null` rather than an empty list when there are none.
+    #[serde(default)]
+    statuses: Option<Vec<FjStatus>>,
+}
+
+#[derive(Deserialize)]
+struct FjStatus {
+    status: String,
+}
+
+#[derive(Deserialize)]
 struct FjPullRef {
     #[serde(default)]
     merged: bool,
@@ -493,6 +763,61 @@ impl Forge for Forgejo {
 
     fn exclude(&self) -> &[String] {
         &self.exclude
+    }
+
+    /// Two calls per pull request: the PR for its head and mergeability,
+    /// then the combined status of that commit.
+    fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>> {
+        let mut out = Vec::new();
+        for r in prs.iter().take(FORGEJO_CHECKS_PER_POLL) {
+            let pr_url = format!(
+                "{}/api/v1/repos/{}/{}/pulls/{}",
+                self.base, r.owner, r.repo, r.number
+            );
+            let pr: FjPull = match self.get(&pr_url) {
+                Ok(pr) => pr,
+                Err(e) => {
+                    log::warn!("checks for {}: {e:#}", r.label());
+                    continue;
+                }
+            };
+            let status_url = format!(
+                "{}/api/v1/repos/{}/{}/commits/{}/status",
+                self.base, r.owner, r.repo, pr.head.sha
+            );
+            let combined: FjCombinedStatus = match self.get(&status_url) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("status for {}: {e:#}", r.label());
+                    continue;
+                }
+            };
+            let statuses = combined.statuses.unwrap_or_default();
+            let (passed, failed, pending) =
+                tally(statuses.iter().map(|st| match st.status.as_str() {
+                    "success" => CheckOutcome::Passed,
+                    "pending" => CheckOutcome::Pending,
+                    _ => CheckOutcome::Failed,
+                }));
+            let merge = match pr.mergeable {
+                Some(true) => MergeState::Clean,
+                Some(false) => MergeState::Conflicting,
+                None => MergeState::Unknown,
+            };
+            out.push((
+                r.key(),
+                Checks {
+                    passed,
+                    failed,
+                    pending,
+                    total: passed + failed + pending,
+                    merge,
+                    head_sha: pr.head.sha,
+                    checked_at: Utc::now(),
+                },
+            ));
+        }
+        Ok(out)
     }
 
     fn fetch_open(&self) -> Result<Vec<RemoteItem>> {
@@ -521,6 +846,34 @@ impl Forge for Forgejo {
         let it: FjIssue = self.get(&url)?;
         Ok(self.convert(it))
     }
+}
+
+/// Second phase: CI and merge state for the open pull requests that are
+/// due, see `Store::checks_due`.
+fn sync_checks(forge: &dyn Forge, shared: &SharedRef) -> Result<()> {
+    let due = {
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        s.store
+            .checks_due(forge.provider(), &forge.host(), Utc::now())
+    };
+    if due.is_empty() {
+        return Ok(());
+    }
+    log::debug!("checking CI state of {} pull requests", due.len());
+    let results = forge.fetch_checks(&due)?;
+    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let mut changed = false;
+    for (key, checks) in results {
+        changed |= s.store.set_checks(&key, checks);
+    }
+    // Always save: checked_at moved even when the numbers did not.
+    if let Err(e) = s.store.save() {
+        log::error!("save store: {e:#}");
+    }
+    if changed {
+        s.notify();
+    }
+    Ok(())
 }
 
 /// A 404 or 410 from an individual fetch.
@@ -578,10 +931,11 @@ pub fn run_loop(
     rx: Receiver<SyncCmd>,
     interval: Duration,
     on_close: OnClose,
+    checks: bool,
 ) {
     let mut round = 0usize;
     loop {
-        sync_once(&forges, &shared, on_close, round);
+        sync_once(&forges, &shared, on_close, checks, round);
         round = round.wrapping_add(1);
         match rx.recv_timeout(interval) {
             Ok(SyncCmd::Now) | Err(RecvTimeoutError::Timeout) => continue,
@@ -592,7 +946,13 @@ pub fn run_loop(
 
 /// `round` rotates which tracked items get an individual check when there
 /// are more than `MAX_INDIVIDUAL_CHECKS` of them.
-pub fn sync_once(forges: &[Box<dyn Forge>], shared: &SharedRef, on_close: OnClose, round: usize) {
+pub fn sync_once(
+    forges: &[Box<dyn Forge>],
+    shared: &SharedRef,
+    on_close: OnClose,
+    checks: bool,
+    round: usize,
+) {
     if forges.is_empty() {
         return;
     }
@@ -607,6 +967,13 @@ pub fn sync_once(forges: &[Box<dyn Forge>], shared: &SharedRef, on_close: OnClos
             let msg = format!("{} {}: {e:#}", forge.provider().label(), forge.host());
             log::warn!("{msg}");
             errors.push(msg);
+        }
+        if checks && let Err(e) = sync_checks(forge.as_ref(), shared) {
+            log::warn!(
+                "{} {} checks: {e:#}",
+                forge.provider().label(),
+                forge.host()
+            );
         }
     }
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -755,6 +1122,47 @@ mod tests {
         assert_eq!(item.r.kind, RemoteKind::PullRequest);
         assert_eq!(item.r.state, RemoteState::Merged);
         assert_eq!(item.r.key(), "github:github.com/o/r#7");
+    }
+
+    #[test]
+    fn graphql_reply_becomes_checks() {
+        let json = r#"{"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "PENDING",
+            "contexts": {"totalCount": 4, "nodes": [
+                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": null},
+                {"__typename": "StatusContext", "state": "SUCCESS"}]}}}}]}}"#;
+        let pr: GqlPr = serde_json::from_str(json).unwrap();
+        let c = pr.into_checks(Utc::now());
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (2, 1, 1, 4));
+        assert_eq!(c.merge, MergeState::Blocked);
+        assert_eq!(c.head_sha, "abc123");
+        assert!(c.unsettled());
+
+        let json = r#"{"headRefOid": "def", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY",
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": null}}]}}"#;
+        let c: Checks = serde_json::from_str::<GqlPr>(json)
+            .unwrap()
+            .into_checks(Utc::now());
+        assert_eq!(c.merge, MergeState::Conflicting);
+        assert_eq!(c.total, 0);
+        assert!(!c.unsettled());
+    }
+
+    #[test]
+    fn graphql_url_sits_next_to_the_rest_api() {
+        let mut gh = GitHub {
+            api_url: "https://api.github.com".into(),
+            host: "github.com".into(),
+            token: String::new(),
+            queries: vec![],
+            exclude: vec![],
+            http: Http::new(),
+        };
+        assert_eq!(gh.graphql_url(), "https://api.github.com/graphql");
+        gh.api_url = "https://ghe.example.com/api/v3".into();
+        assert_eq!(gh.graphql_url(), "https://ghe.example.com/api/graphql");
     }
 
     #[test]

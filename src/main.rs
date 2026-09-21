@@ -149,11 +149,12 @@ fn main() -> anyhow::Result<()> {
     let forges = sync::build_forges(&cfg, &shared);
     let interval = Duration::from_secs(cfg.poll_interval_secs.max(15));
     let on_close = cfg.on_close;
+    let checks = cfg.checks;
     {
         let shared = shared.clone();
         std::thread::Builder::new()
             .name("sync".into())
-            .spawn(move || sync::run_loop(forges, shared, sync_rx, interval, on_close))?;
+            .spawn(move || sync::run_loop(forges, shared, sync_rx, interval, on_close, checks))?;
     }
 
     systemd::notify("READY=1\n");

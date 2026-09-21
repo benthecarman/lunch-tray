@@ -38,6 +38,9 @@ poll_interval_secs = 120
 # "settle" keeps it in Settled, "archive" puts it straight in the archive.
 # on_close = "settle"
 
+# Show CI results and merge conflicts on open pull requests.
+# checks = true
+
 # GitHub accounts. With no token, Lunch Tray runs `gh auth token`.
 [[github]]
 # api_url = "https://api.github.com"
@@ -74,6 +77,9 @@ pub struct Config {
     /// Where closed or merged items go: `settle` (default) or `archive`.
     #[serde(default)]
     pub on_close: OnClose,
+    /// Fetch CI results and merge state for open pull requests.
+    #[serde(default = "default_true")]
+    pub checks: bool,
     #[serde(default)]
     pub github: Vec<GithubAccount>,
     #[serde(default)]
@@ -85,6 +91,7 @@ impl Default for Config {
         Config {
             poll_interval_secs: default_poll(),
             on_close: OnClose::Settle,
+            checks: true,
             github: vec![GithubAccount::default()],
             forgejo: Vec::new(),
         }
@@ -93,6 +100,10 @@ impl Default for Config {
 
 fn default_poll() -> u64 {
     120
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -16,6 +16,10 @@ tray icon.
 - Full window with Pinned, Active, Settled, and Archived sections.
 - GitHub and Forgejo (or Gitea) sync. New open items become tasks. Closed or
   merged items settle on their own. New activity on a settled item wakes it.
+- CI results and merge state on open pull requests: passed over total
+  checks, and a warning when the branch conflicts with its base. Fetched
+  only when missing, stale, still running, or after the pull request moved,
+  in one GraphQL request per 50 pull requests on GitHub.
 - Manual tasks with notes and a link.
 - The window is a tray: a mint-grey melamine surface with a recessed
   compartment per section, and mustard for the few things that need
@@ -92,6 +96,7 @@ watches GitHub through the token from `gh auth token`.
 ```toml
 poll_interval_secs = 120
 on_close = "settle"   # or "archive": closed and merged items skip Settled
+checks = true         # CI results and merge state on open pull requests
 
 [[github]]
 # token = "ghp_..."            # or token_env, GITHUB_TOKEN, or `gh auth token`

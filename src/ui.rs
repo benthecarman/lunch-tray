@@ -13,7 +13,9 @@ use egui::{
 };
 
 use crate::config::APP_ID;
-use crate::model::{Origin, RemoteKind, RemoteState, Rung, Sections, Task, TaskState, ThemePref};
+use crate::model::{
+    MergeState, Origin, RemoteKind, RemoteState, Rung, Sections, Task, TaskState, ThemePref,
+};
 use crate::shared::{Notice, NoticeKind, SharedRef, UiRequest, WindowMode};
 use crate::style::{
     self, Palette, RADIUS, WINDOW_RADIUS, danger_button, icon_button, icons, primary_button,
@@ -1392,15 +1394,70 @@ fn row(ui: &mut egui::Ui, p: &Palette, t: &Task, ctx: RowCtx, actions: &mut Vec<
             .truncate(),
         );
     });
-    left.add(
-        Label::new(
-            RichText::new(subtitle(t, compact))
-                .text_style(TextStyle::Small)
-                .color(p.text_weak),
-        )
-        .truncate(),
-    );
+    left.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        checks_badge(ui, p, t);
+        ui.add(
+            Label::new(
+                RichText::new(subtitle(t, compact))
+                    .text_style(TextStyle::Small)
+                    .color(p.text_weak),
+            )
+            .truncate(),
+        );
+    });
     menu_is_open
+}
+
+/// CI result and merge state of an open pull request, ahead of the meta
+/// line: passed over total in green, red while something failed, mustard
+/// while runs are going, and a warning when the branch has conflicts.
+fn checks_badge(ui: &mut egui::Ui, p: &Palette, t: &Task) {
+    let Some(r) = t.remote() else {
+        return;
+    };
+    if r.state != RemoteState::Open {
+        return;
+    }
+    let Some(c) = &r.checks else {
+        return;
+    };
+    if c.total > 0 {
+        let (icon, color, tip) = if c.failed > 0 {
+            (
+                icons::X_CIRCLE,
+                p.closed,
+                format!("{} of {} checks failed", c.failed, c.total),
+            )
+        } else if c.pending > 0 {
+            (
+                icons::CIRCLE_DASHED,
+                p.accent,
+                format!("{} of {} checks still running", c.pending, c.total),
+            )
+        } else {
+            (icons::CHECK_CIRCLE, p.open, "All checks passed".to_string())
+        };
+        ui.label(
+            RichText::new(format!("{icon} {}/{}", c.passed, c.total))
+                .text_style(TextStyle::Small)
+                .color(color),
+        )
+        .on_hover_text(tip);
+    }
+    let conflict = match c.merge {
+        MergeState::Conflicting => Some("Conflicts with the base branch: needs a rebase"),
+        MergeState::Behind => Some("Behind the base branch"),
+        _ => None,
+    };
+    if let Some(tip) = conflict {
+        ui.label(
+            RichText::new(icons::WARNING)
+                .text_style(TextStyle::Small)
+                .color(p.warning),
+        )
+        .on_hover_text(tip);
+    }
 }
 
 /// The overflow menu. Every item is closed from one place, here, before the

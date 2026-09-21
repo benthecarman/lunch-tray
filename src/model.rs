@@ -76,6 +76,47 @@ pub enum OnClose {
     Archive,
 }
 
+/// Whether a pull request can merge as it stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeState {
+    #[default]
+    Unknown,
+    Clean,
+    /// Conflicts with the base branch: needs a rebase.
+    Conflicting,
+    /// Behind the base branch.
+    Behind,
+    /// Blocked by a rule such as a missing review.
+    Blocked,
+    /// Checks are failing.
+    Unstable,
+}
+
+/// CI and merge state of a pull request's head, as last fetched.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checks {
+    pub passed: u32,
+    pub failed: u32,
+    pub pending: u32,
+    pub total: u32,
+    pub merge: MergeState,
+    pub head_sha: String,
+    pub checked_at: DateTime<Utc>,
+}
+
+impl Checks {
+    /// True while a run is still going or the merge state is not known yet,
+    /// so the next poll should look again.
+    pub fn unsettled(&self) -> bool {
+        self.pending > 0 || self.merge == MergeState::Unknown
+    }
+}
+
+/// How long a settled check result is trusted before it is refreshed, so
+/// conflicts caused by other merges still surface.
+pub const CHECKS_MAX_AGE: chrono::Duration = chrono::Duration::minutes(30);
+
 /// A pull request or issue on a remote forge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteRef {
@@ -96,6 +137,9 @@ pub struct RemoteRef {
     /// item that leaves the queries no longer needs you.
     #[serde(default = "default_true")]
     pub in_queries: bool,
+    /// CI and merge state, kept across syncs and refreshed only when due.
+    #[serde(default)]
+    pub checks: Option<Checks>,
 }
 
 fn default_true() -> bool {
@@ -126,6 +170,7 @@ impl RemoteRef {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[allow(clippy::large_enum_variant)]
 pub enum Origin {
     Manual,
     Remote(RemoteRef),
@@ -378,6 +423,59 @@ impl Store {
             .count()
     }
 
+    /// Open pull requests on `provider`/`host` whose check state should be
+    /// fetched now: none saved, the item moved since the last fetch, the
+    /// last result was still pending, or it is older than `CHECKS_MAX_AGE`.
+    /// Most recently updated first.
+    pub fn checks_due(&self, provider: Provider, host: &str, now: DateTime<Utc>) -> Vec<RemoteRef> {
+        let mut due: Vec<RemoteRef> = self
+            .data
+            .tasks
+            .iter()
+            .filter_map(|t| t.remote())
+            .filter(|r| {
+                r.provider == provider
+                    && r.host == host
+                    && r.kind == RemoteKind::PullRequest
+                    && r.state == RemoteState::Open
+                    && match &r.checks {
+                        None => true,
+                        Some(c) => {
+                            r.remote_updated_at > c.checked_at
+                                || c.unsettled()
+                                || now - c.checked_at > CHECKS_MAX_AGE
+                        }
+                    }
+            })
+            .cloned()
+            .collect();
+        due.sort_by_key(|r| std::cmp::Reverse(r.remote_updated_at));
+        due
+    }
+
+    /// Store a fetched check state. Returns true when it changed.
+    pub fn set_checks(&mut self, key: &str, checks: Checks) -> bool {
+        let Some(t) = self.get_mut(key) else {
+            return false;
+        };
+        let Origin::Remote(r) = &mut t.origin else {
+            return false;
+        };
+        let same = r.checks.as_ref().is_some_and(|c| {
+            (c.passed, c.failed, c.pending, c.total, c.merge, &c.head_sha)
+                == (
+                    checks.passed,
+                    checks.failed,
+                    checks.pending,
+                    checks.total,
+                    checks.merge,
+                    &checks.head_sha,
+                )
+        });
+        r.checks = Some(checks);
+        !same
+    }
+
     /// When the task last moved: the remote item's update time, or the
     /// task's own for manual ones.
     pub fn last_activity(t: &Task) -> DateTime<Utc> {
@@ -621,8 +719,11 @@ impl Store {
                 t.remote_title = Some(item.title.clone());
                 changed = true;
             }
-            if old != item.r {
-                t.origin = Origin::Remote(item.r.clone());
+            // Sync results carry no check state; keep what we have.
+            let mut fresh = item.r.clone();
+            fresh.checks = old.checks.clone();
+            if old != fresh {
+                t.origin = Origin::Remote(fresh);
                 changed = true;
             }
             let was_open = old.state == RemoteState::Open;
@@ -730,6 +831,7 @@ mod tests {
                 draft: false,
                 remote_updated_at: updated,
                 in_queries: true,
+                checks: None,
             },
             title: format!("PR {number}"),
         }
@@ -1165,6 +1267,81 @@ mod tests {
         assert!(note.matches("readme"));
         assert!(!note.matches("octo"));
         assert!(pr.matches(""));
+    }
+
+    fn checks(pending: u32, merge: MergeState, at: DateTime<Utc>) -> Checks {
+        Checks {
+            passed: 3,
+            failed: 0,
+            pending,
+            total: 3 + pending,
+            merge,
+            head_sha: "abc".into(),
+            checked_at: at,
+        }
+    }
+
+    #[test]
+    fn check_state_survives_a_sync_and_is_fetched_only_when_due() {
+        let mut s = Store::in_memory();
+        let now = t0() + Duration::hours(1);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        // Missing: due.
+        assert_eq!(s.checks_due(Provider::GitHub, "github.com", now).len(), 1);
+        assert!(s.set_checks(&id, checks(0, MergeState::Clean, now)));
+        assert!(!s.set_checks(&id, checks(0, MergeState::Clean, now)));
+        // Fresh and settled: not due, and a sync keeps it.
+        assert!(s.checks_due(Provider::GitHub, "github.com", now).is_empty());
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        assert!(s.get(&id).unwrap().remote().unwrap().checks.is_some());
+        // The PR moved after the check: due again.
+        s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Open, now + Duration::minutes(1))],
+        );
+        assert_eq!(
+            s.checks_due(Provider::GitHub, "github.com", now + Duration::minutes(2))
+                .len(),
+            1
+        );
+        // Pending results are polled until they settle.
+        s.set_checks(
+            &id,
+            checks(2, MergeState::Clean, now + Duration::minutes(2)),
+        );
+        assert_eq!(
+            s.checks_due(Provider::GitHub, "github.com", now + Duration::minutes(3))
+                .len(),
+            1
+        );
+        s.set_checks(
+            &id,
+            checks(0, MergeState::Clean, now + Duration::minutes(3)),
+        );
+        assert!(
+            s.checks_due(Provider::GitHub, "github.com", now + Duration::minutes(4))
+                .is_empty()
+        );
+        // Old results are refreshed.
+        assert_eq!(
+            s.checks_due(Provider::GitHub, "github.com", now + Duration::hours(2))
+                .len(),
+            1
+        );
+        // Other hosts and closed PRs are never due.
+        assert!(
+            s.checks_due(Provider::Forgejo, "codeberg.org", now + Duration::hours(2))
+                .is_empty()
+        );
+        s.apply_remote(
+            OnClose::Settle,
+            &[remote(1, RemoteState::Merged, now + Duration::hours(2))],
+        );
+        assert!(
+            s.checks_due(Provider::GitHub, "github.com", now + Duration::hours(3))
+                .is_empty()
+        );
     }
 
     #[test]
