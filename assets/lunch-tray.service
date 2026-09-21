@@ -1,0 +1,19 @@
+[Unit]
+Description=Lunch Tray
+Documentation=https://github.com/benthecarman/lunch-tray
+# Lives and dies with the graphical session, after the shell is up.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=notify
+ExecStart=%h/.cargo/bin/lunch-tray --hidden
+# SIGHUP asks for a sync now.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+Slice=app.slice
+
+[Install]
+WantedBy=graphical-session.target

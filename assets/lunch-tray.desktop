@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Lunch Tray
+Comment=Tray todo list for your pull requests and issues
+Exec=lunch-tray
+Icon=checkbox-checked-symbolic
+Terminal=false
+Categories=Utility;
+StartupWMClass=lunch-tray
