@@ -79,6 +79,9 @@ pub struct RemoteRef {
     pub url: String,
     pub author: String,
     pub state: RemoteState,
+    /// A draft pull request. Rendered muted, since it is not ready yet.
+    #[serde(default)]
+    pub draft: bool,
     pub remote_updated_at: DateTime<Utc>,
     /// True while one of the configured queries returns the item. An open
     /// item that leaves the queries no longer needs you.
@@ -686,6 +689,7 @@ mod tests {
                 url: format!("https://github.com/octo/cat/pull/{number}"),
                 author: "me".into(),
                 state,
+                draft: false,
                 remote_updated_at: updated,
                 in_queries: true,
             },

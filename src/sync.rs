@@ -285,6 +285,7 @@ impl GitHub {
                 url: it.html_url,
                 author: it.user.map(|u| u.login).unwrap_or_default(),
                 state,
+                draft: it.draft,
                 remote_updated_at: parse_time(&it.updated_at),
                 in_queries: true,
             },
@@ -308,6 +309,8 @@ struct GhIssue {
     repository_url: String,
     user: Option<GhUser>,
     pull_request: Option<GhPullRef>,
+    #[serde(default)]
+    draft: bool,
 }
 
 #[derive(Deserialize)]
@@ -427,6 +430,7 @@ impl Forgejo {
                 },
             ),
         };
+        let draft = it.pull_request.as_ref().is_some_and(|pr| pr.draft);
         RemoteItem {
             r: RemoteRef {
                 provider: Provider::Forgejo,
@@ -438,6 +442,7 @@ impl Forgejo {
                 url: it.html_url,
                 author: it.user.map(|u| u.login).unwrap_or_default(),
                 state,
+                draft,
                 remote_updated_at: parse_time(&it.updated_at),
                 in_queries: true,
             },
@@ -473,6 +478,8 @@ struct FjUser {
 struct FjPullRef {
     #[serde(default)]
     merged: bool,
+    #[serde(default)]
+    draft: bool,
 }
 
 impl Forge for Forgejo {
@@ -732,9 +739,11 @@ mod tests {
         let json = r#"{"number": 7, "title": "Fix it", "html_url": "https://github.com/o/r/pull/7",
             "state": "closed", "updated_at": "2026-02-03T04:05:06Z",
             "repository_url": "https://api.github.com/repos/o/r",
-            "user": {"login": "ben"}, "pull_request": {"merged_at": "2026-02-03T04:05:06Z"}}"#;
+            "user": {"login": "ben"}, "pull_request": {"merged_at": "2026-02-03T04:05:06Z"},
+            "draft": true}"#;
         let it: GhIssue = serde_json::from_str(json).unwrap();
         let item = gh.convert(it).unwrap();
+        assert!(item.r.draft);
         assert_eq!(item.r.owner, "o");
         assert_eq!(item.r.repo, "r");
         assert_eq!(item.r.kind, RemoteKind::PullRequest);
@@ -758,6 +767,7 @@ mod tests {
             "user": {"login": "ben"}, "pull_request": null}"#;
         let it: FjIssue = serde_json::from_str(json).unwrap();
         let item = fj.convert(it);
+        assert!(!item.r.draft);
         assert_eq!(item.r.kind, RemoteKind::Issue);
         assert_eq!(item.r.state, RemoteState::Open);
         assert_eq!(item.r.project(), "o/r");

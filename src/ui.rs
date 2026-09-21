@@ -1135,6 +1135,9 @@ fn ago_from(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
 fn task_glyph(p: &Palette, t: &Task) -> (&'static str, Color32) {
     match &t.origin {
         Origin::Remote(r) => match (r.kind, r.state) {
+            (RemoteKind::PullRequest, RemoteState::Open) if r.draft => {
+                (icons::GIT_PULL_REQUEST, p.text_weak)
+            }
             (RemoteKind::PullRequest, RemoteState::Open) => (icons::GIT_PULL_REQUEST, p.open),
             (RemoteKind::PullRequest, RemoteState::Merged) => (icons::GIT_MERGE, p.merged),
             (RemoteKind::PullRequest, RemoteState::Closed) => (icons::GIT_PULL_REQUEST, p.closed),
@@ -1149,10 +1152,11 @@ fn task_glyph(p: &Palette, t: &Task) -> (&'static str, Color32) {
 fn subtitle(t: &Task, compact: bool) -> String {
     match &t.origin {
         Origin::Remote(r) => {
-            let what = match r.state {
-                RemoteState::Merged => "merged",
-                RemoteState::Closed => "closed",
-                RemoteState::Open => "updated",
+            let what = match (r.state, r.draft) {
+                (RemoteState::Merged, _) => "merged",
+                (RemoteState::Closed, _) => "closed",
+                (RemoteState::Open, true) => "draft, updated",
+                (RemoteState::Open, false) => "updated",
             };
             let when = ago(r.remote_updated_at);
             if compact {
