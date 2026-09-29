@@ -19,8 +19,9 @@ use crate::shared::{Notice, SharedRef};
 const USER_AGENT: &str = concat!("lunch-tray/", env!("CARGO_PKG_VERSION"));
 const MAX_PAGES: usize = 5;
 const MAX_INDIVIDUAL_CHECKS: usize = 60;
-/// Pull requests per GraphQL request.
-const GRAPHQL_BATCH: usize = 50;
+/// Pull requests per GraphQL request. GitHub gives a query about ten
+/// seconds; bigger batches across many repositories time out with a 502.
+const GRAPHQL_BATCH: usize = 15;
 /// Forgejo needs two calls per pull request; cap each poll.
 const FORGEJO_CHECKS_PER_POLL: usize = 20;
 
@@ -161,8 +162,10 @@ impl Http {
                 }
                 bail!("GET {url}: http status 403");
             }
+            let method = if body.is_some() { "POST" } else { "GET" };
             if status >= 400 {
-                return Err(ureq::Error::StatusCode(status)).with_context(|| format!("GET {url}"));
+                return Err(ureq::Error::StatusCode(status))
+                    .with_context(|| format!("{method} {url}"));
             }
             return resp
                 .body_mut()
@@ -297,6 +300,54 @@ impl GitHub {
         }
     }
 
+    fn checks_batch(&self, batch: &[RemoteRef]) -> Result<Vec<(String, Checks)>> {
+        let mut query = String::from("query {");
+        for (i, r) in batch.iter().enumerate() {
+            query.push_str(&format!(
+                " p{i}: repository(owner: {owner}, name: {repo}) {{ pullRequest(number: {n}) {{ ...pr }} }}",
+                owner = serde_json::to_string(&r.owner)?,
+                repo = serde_json::to_string(&r.repo)?,
+                n = r.number
+            ));
+        }
+        query.push_str(
+            " } fragment pr on PullRequest { headRefOid mergeable mergeStateStatus \
+             commits(last: 1) { nodes { commit { statusCheckRollup { state \
+             contexts(first: 60) { totalCount nodes { __typename \
+             ... on CheckRun { status conclusion } ... on StatusContext { state } } } } } } } }",
+        );
+        let reply: GqlReply = self.http.post_json(
+            &self.graphql_url(),
+            &[("Authorization", format!("Bearer {}", self.token))],
+            &serde_json::json!({ "query": query }),
+        )?;
+        if let Some(errors) = &reply.errors {
+            for e in errors {
+                log::debug!("graphql: {}", e.message);
+            }
+        }
+        let mut out = Vec::new();
+        let Some(data) = reply.data else {
+            bail!("graphql reply carried no data");
+        };
+        let now = Utc::now();
+        for (i, r) in batch.iter().enumerate() {
+            let node = data
+                .get(format!("p{i}"))
+                .and_then(|v| v.get("pullRequest"))
+                .cloned()
+                .filter(|v| !v.is_null());
+            let Some(node) = node else {
+                continue;
+            };
+            match serde_json::from_value::<GqlPr>(node) {
+                Ok(pr) => out.push((r.key(), pr.into_checks(now))),
+                Err(e) => log::warn!("checks for {}: {e}", r.label()),
+            }
+        }
+        Ok(out)
+    }
+
     pub fn new(acc: &GithubAccount) -> Result<Self> {
         Ok(GitHub {
             api_url: acc.api_url.trim_end_matches('/').to_string(),
@@ -407,53 +458,25 @@ impl Forge for GitHub {
         &self.exclude
     }
 
-    /// One GraphQL request per `GRAPHQL_BATCH` pull requests: each alias
-    /// asks for the merge state and the check rollup of the head commit.
+    /// Batches of `GRAPHQL_BATCH` pull requests per GraphQL request: each
+    /// alias asks for the merge state and the check rollup of the head
+    /// commit. A batch that fails is split in half and retried, down to
+    /// single pull requests, so one slow repository cannot stall the rest.
     fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>> {
         let mut out = Vec::new();
-        for batch in prs.chunks(GRAPHQL_BATCH) {
-            let mut query = String::from("query {");
-            for (i, r) in batch.iter().enumerate() {
-                query.push_str(&format!(
-                    " p{i}: repository(owner: {owner}, name: {repo}) {{ pullRequest(number: {n}) {{ ...pr }} }}",
-                    owner = serde_json::to_string(&r.owner)?,
-                    repo = serde_json::to_string(&r.repo)?,
-                    n = r.number
-                ));
-            }
-            query.push_str(
-                " } fragment pr on PullRequest { headRefOid mergeable mergeStateStatus \
-                 commits(last: 1) { nodes { commit { statusCheckRollup { state \
-                 contexts(first: 100) { totalCount nodes { __typename \
-                 ... on CheckRun { status conclusion } ... on StatusContext { state } } } } } } } }",
-            );
-            let reply: GqlReply = self.http.post_json(
-                &self.graphql_url(),
-                &[("Authorization", format!("Bearer {}", self.token))],
-                &serde_json::json!({ "query": query }),
-            )?;
-            if let Some(errors) = &reply.errors {
-                for e in errors {
-                    log::debug!("graphql: {}", e.message);
+        let mut queue: std::collections::VecDeque<&[RemoteRef]> =
+            prs.chunks(GRAPHQL_BATCH).collect();
+        while let Some(batch) = queue.pop_front() {
+            match self.checks_batch(batch) {
+                Ok(found) => out.extend(found),
+                Err(e) if is_auth_error(&e) => return Err(e),
+                Err(e) if batch.len() > 1 => {
+                    log::debug!("checks batch of {} failed, splitting: {e:#}", batch.len());
+                    let (a, b) = batch.split_at(batch.len() / 2);
+                    queue.push_front(b);
+                    queue.push_front(a);
                 }
-            }
-            let Some(data) = reply.data else {
-                continue;
-            };
-            let now = Utc::now();
-            for (i, r) in batch.iter().enumerate() {
-                let node = data
-                    .get(format!("p{i}"))
-                    .and_then(|v| v.get("pullRequest"))
-                    .cloned()
-                    .filter(|v| !v.is_null());
-                let Some(node) = node else {
-                    continue;
-                };
-                match serde_json::from_value::<GqlPr>(node) {
-                    Ok(pr) => out.push((r.key(), pr.into_checks(now))),
-                    Err(e) => log::warn!("checks for {}: {e}", r.label()),
-                }
+                Err(e) => log::warn!("checks for {}: {e:#}", batch[0].label()),
             }
         }
         Ok(out)
@@ -874,6 +897,14 @@ fn sync_checks(forge: &dyn Forge, shared: &SharedRef) -> Result<()> {
         s.notify();
     }
     Ok(())
+}
+
+/// A 401 or 403: the token is the problem, not the request.
+fn is_auth_error(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ureq::Error>(),
+        Some(ureq::Error::StatusCode(401 | 403))
+    )
 }
 
 /// A 404 or 410 from an individual fetch.
