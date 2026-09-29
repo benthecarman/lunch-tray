@@ -453,6 +453,18 @@ impl Store {
         due
     }
 
+    /// Make every saved check result due on the next sync. Called at
+    /// startup so a new build never shows results computed by an old one.
+    pub fn mark_checks_stale(&mut self) {
+        for t in &mut self.data.tasks {
+            if let Origin::Remote(r) = &mut t.origin
+                && let Some(c) = &mut r.checks
+            {
+                c.checked_at = DateTime::<Utc>::MIN_UTC;
+            }
+        }
+    }
+
     /// Store a fetched check state. Returns true when it changed.
     pub fn set_checks(&mut self, key: &str, checks: Checks) -> bool {
         let Some(t) = self.get_mut(key) else {
@@ -1341,6 +1353,30 @@ mod tests {
         assert!(
             s.checks_due(Provider::GitHub, "github.com", now + Duration::hours(3))
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_restart_makes_every_check_result_due() {
+        let mut s = Store::in_memory();
+        let now = Utc::now();
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        s.set_checks(&id, checks(0, MergeState::Clean, now));
+        assert!(s.checks_due(Provider::GitHub, "github.com", now).is_empty());
+        s.mark_checks_stale();
+        assert_eq!(s.checks_due(Provider::GitHub, "github.com", now).len(), 1);
+        // The numbers themselves are kept for display until the fetch lands.
+        assert_eq!(
+            s.get(&id)
+                .unwrap()
+                .remote()
+                .unwrap()
+                .checks
+                .as_ref()
+                .unwrap()
+                .passed,
+            3
         );
     }
 

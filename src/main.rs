@@ -74,7 +74,8 @@ fn main() -> anyhow::Result<()> {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(format!("{e:#}"))),
     };
-    let store = Store::load(&store_path()).context("load tasks")?;
+    let mut store = Store::load(&store_path()).context("load tasks")?;
+    store.mark_checks_stale();
 
     let shared = Arc::new(Mutex::new(Shared {
         store,
