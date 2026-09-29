@@ -313,8 +313,9 @@ impl GitHub {
         query.push_str(
             " } fragment pr on PullRequest { headRefOid mergeable mergeStateStatus \
              commits(last: 1) { nodes { commit { statusCheckRollup { state \
-             contexts(first: 60) { totalCount nodes { __typename \
-             ... on CheckRun { status conclusion } ... on StatusContext { state } } } } } } } }",
+             contexts(first: 100) { nodes { __typename \
+             ... on CheckRun { name status conclusion startedAt } \
+             ... on StatusContext { context state createdAt } } } } } } } }",
         );
         let reply: GqlReply = self.http.post_json(
             &self.graphql_url(),
@@ -552,30 +553,65 @@ struct GqlRollup {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct GqlContexts {
-    total_count: u32,
     nodes: Vec<GqlContext>,
 }
 
 #[derive(Deserialize)]
 #[serde(tag = "__typename")]
 enum GqlContext {
+    #[serde(rename_all = "camelCase")]
     CheckRun {
+        name: String,
         status: String,
         conclusion: Option<String>,
+        started_at: Option<String>,
     },
+    #[serde(rename_all = "camelCase")]
     StatusContext {
+        context: String,
         state: String,
+        created_at: Option<String>,
     },
     #[serde(other)]
     Other,
 }
 
+/// Re-running a workflow leaves the earlier runs on the commit next to the
+/// new ones. Keep only the latest run of each name, as GitHub's own view
+/// does.
+fn latest_per_name(nodes: &[GqlContext]) -> Vec<&GqlContext> {
+    let mut latest: std::collections::BTreeMap<&str, (&str, &GqlContext)> =
+        std::collections::BTreeMap::new();
+    for node in nodes {
+        let (name, when) = match node {
+            GqlContext::CheckRun {
+                name, started_at, ..
+            } => (name.as_str(), started_at.as_deref().unwrap_or("")),
+            GqlContext::StatusContext {
+                context,
+                created_at,
+                ..
+            } => (context.as_str(), created_at.as_deref().unwrap_or("")),
+            GqlContext::Other => continue,
+        };
+        // ISO 8601 timestamps sort as text; ties go to the later entry.
+        match latest.get(name) {
+            Some((seen, _)) if *seen > when => {}
+            _ => {
+                latest.insert(name, (when, node));
+            }
+        }
+    }
+    latest.into_values().map(|(_, node)| node).collect()
+}
+
 impl GqlContext {
     fn outcome(&self) -> CheckOutcome {
         match self {
-            GqlContext::CheckRun { status, conclusion } => {
+            GqlContext::CheckRun {
+                status, conclusion, ..
+            } => {
                 if status != "COMPLETED" {
                     return CheckOutcome::Pending;
                 }
@@ -585,7 +621,7 @@ impl GqlContext {
                     Some(_) => CheckOutcome::Failed,
                 }
             }
-            GqlContext::StatusContext { state } => match state.as_str() {
+            GqlContext::StatusContext { state, .. } => match state.as_str() {
                 "SUCCESS" => CheckOutcome::Passed,
                 "PENDING" | "EXPECTED" => CheckOutcome::Pending,
                 _ => CheckOutcome::Failed,
@@ -616,8 +652,9 @@ impl GqlPr {
             .and_then(|n| n.commit.status_check_rollup);
         let (passed, failed, pending, total) = match rollup {
             Some(r) => {
-                let (p, f, pe) = tally(r.contexts.nodes.iter().map(GqlContext::outcome));
-                (p, f, pe, r.contexts.total_count.max(p + f + pe))
+                let runs = latest_per_name(&r.contexts.nodes);
+                let (p, f, pe) = tally(runs.iter().map(|c| c.outcome()));
+                (p, f, pe, p + f + pe)
             }
             None => (0, 0, 0, 0),
         };
@@ -1160,10 +1197,10 @@ mod tests {
         let json = r#"{"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "PENDING",
             "contexts": {"totalCount": 4, "nodes": [
-                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
-                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"},
-                {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": null},
-                {"__typename": "StatusContext", "state": "SUCCESS"}]}}}}]}}"#;
+                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-09-29T10:00:00Z"},
+                {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "FAILURE", "startedAt": "2026-09-29T10:00:00Z"},
+                {"__typename": "CheckRun", "name": "test", "status": "IN_PROGRESS", "conclusion": null, "startedAt": "2026-09-29T10:00:00Z"},
+                {"__typename": "StatusContext", "context": "ci/external", "state": "SUCCESS", "createdAt": "2026-09-29T10:00:00Z"}]}}}}]}}"#;
         let pr: GqlPr = serde_json::from_str(json).unwrap();
         let c = pr.into_checks(Utc::now());
         assert_eq!((c.passed, c.failed, c.pending, c.total), (2, 1, 1, 4));
@@ -1179,6 +1216,22 @@ mod tests {
         assert_eq!(c.merge, MergeState::Conflicting);
         assert_eq!(c.total, 0);
         assert!(!c.unsettled());
+    }
+
+    #[test]
+    fn rerun_checks_count_once_with_the_latest_result() {
+        let json = r#"{"headRefOid": "abc", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS",
+            "contexts": {"totalCount": 5, "nodes": [
+                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "FAILURE", "startedAt": "2026-09-29T09:00:00Z"},
+                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-09-29T10:00:00Z"},
+                {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-09-29T09:00:00Z"},
+                {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-09-29T10:00:00Z"},
+                {"__typename": "StatusContext", "context": "ci/external", "state": "SUCCESS", "createdAt": "2026-09-29T09:00:00Z"}]}}}}]}}"#;
+        let c = serde_json::from_str::<GqlPr>(json)
+            .unwrap()
+            .into_checks(Utc::now());
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (3, 0, 0, 3));
     }
 
     #[test]
