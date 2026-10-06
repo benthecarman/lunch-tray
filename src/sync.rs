@@ -44,7 +44,8 @@ pub trait Forge: Send {
     fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>>;
 }
 
-/// Sort CI contexts into passed, failed, or pending buckets.
+/// Sort CI contexts into passed, failed, or pending buckets. Skipped jobs
+/// never ran, so they count for nothing.
 fn tally(states: impl IntoIterator<Item = CheckOutcome>) -> (u32, u32, u32) {
     let (mut passed, mut failed, mut pending) = (0, 0, 0);
     for s in states {
@@ -52,15 +53,18 @@ fn tally(states: impl IntoIterator<Item = CheckOutcome>) -> (u32, u32, u32) {
             CheckOutcome::Passed => passed += 1,
             CheckOutcome::Failed => failed += 1,
             CheckOutcome::Pending => pending += 1,
+            CheckOutcome::Skipped => {}
         }
     }
     (passed, failed, pending)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckOutcome {
     Passed,
     Failed,
     Pending,
+    Skipped,
 }
 
 /// One HTTP client per account. Error statuses come back as responses so
@@ -616,7 +620,8 @@ impl GqlContext {
                     return CheckOutcome::Pending;
                 }
                 match conclusion.as_deref() {
-                    Some("SUCCESS" | "NEUTRAL" | "SKIPPED") => CheckOutcome::Passed,
+                    Some("SUCCESS" | "NEUTRAL") => CheckOutcome::Passed,
+                    Some("SKIPPED") => CheckOutcome::Skipped,
                     None => CheckOutcome::Pending,
                     Some(_) => CheckOutcome::Failed,
                 }
@@ -855,8 +860,11 @@ impl Forge for Forgejo {
             let statuses = combined.statuses.unwrap_or_default();
             let (passed, failed, pending) =
                 tally(statuses.iter().map(|st| match st.status.as_str() {
-                    "success" => CheckOutcome::Passed,
+                    // Forgejo states: success, warning, pending, skipped,
+                    // failure, error.
+                    "success" | "warning" => CheckOutcome::Passed,
                     "pending" => CheckOutcome::Pending,
+                    "skipped" => CheckOutcome::Skipped,
                     _ => CheckOutcome::Failed,
                 }));
             let merge = match pr.mergeable {
@@ -1232,6 +1240,27 @@ mod tests {
             .unwrap()
             .into_checks(Utc::now());
         assert_eq!((c.passed, c.failed, c.pending, c.total), (3, 0, 0, 3));
+    }
+
+    #[test]
+    fn skipped_jobs_count_for_nothing() {
+        let (p, f, pe) = tally([
+            CheckOutcome::Passed,
+            CheckOutcome::Skipped,
+            CheckOutcome::Failed,
+            CheckOutcome::Skipped,
+            CheckOutcome::Pending,
+        ]);
+        assert_eq!((p, f, pe), (1, 1, 1));
+        let json = r#"{"headRefOid": "abc", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS",
+            "contexts": {"nodes": [
+                {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-10-06T10:00:00Z"},
+                {"__typename": "CheckRun", "name": "notify-failure", "status": "COMPLETED", "conclusion": "SKIPPED", "startedAt": "2026-10-06T10:00:00Z"}]}}}}]}}"#;
+        let c = serde_json::from_str::<GqlPr>(json)
+            .unwrap()
+            .into_checks(Utc::now());
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (1, 0, 0, 1));
     }
 
     #[test]
