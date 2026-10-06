@@ -318,7 +318,8 @@ impl GitHub {
             " } fragment pr on PullRequest { headRefOid mergeable mergeStateStatus \
              commits(last: 1) { nodes { commit { statusCheckRollup { state \
              contexts(first: 100) { nodes { __typename \
-             ... on CheckRun { name status conclusion startedAt } \
+             ... on CheckRun { name status conclusion startedAt \
+             checkSuite { workflowRun { workflow { name } } } } \
              ... on StatusContext { context state createdAt } } } } } } } }",
         );
         let reply: GqlReply = self.http.post_json(
@@ -570,6 +571,7 @@ enum GqlContext {
         status: String,
         conclusion: Option<String>,
         started_at: Option<String>,
+        check_suite: Option<GqlCheckSuite>,
     },
     #[serde(rename_all = "camelCase")]
     StatusContext {
@@ -581,26 +583,56 @@ enum GqlContext {
     Other,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlCheckSuite {
+    workflow_run: Option<GqlWorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct GqlWorkflowRun {
+    workflow: GqlWorkflow,
+}
+
+#[derive(Deserialize)]
+struct GqlWorkflow {
+    name: String,
+}
+
 /// Re-running a workflow leaves the earlier runs on the commit next to the
-/// new ones. Keep only the latest run of each name, as GitHub's own view
-/// does.
+/// new ones. Keep only the latest run of each job, as GitHub's own view
+/// does. Jobs are told apart by workflow and name, since two workflows
+/// can both have a job called `build`.
 fn latest_per_name(nodes: &[GqlContext]) -> Vec<&GqlContext> {
-    let mut latest: std::collections::BTreeMap<&str, (&str, &GqlContext)> =
+    let mut latest: std::collections::BTreeMap<String, (&str, &GqlContext)> =
         std::collections::BTreeMap::new();
     for node in nodes {
         let (name, when) = match node {
             GqlContext::CheckRun {
-                name, started_at, ..
-            } => (name.as_str(), started_at.as_deref().unwrap_or("")),
+                name,
+                started_at,
+                check_suite,
+                ..
+            } => {
+                let workflow = check_suite
+                    .as_ref()
+                    .and_then(|c| c.workflow_run.as_ref())
+                    .map(|w| w.workflow.name.as_str())
+                    .unwrap_or("");
+                (
+                    format!("{workflow} / {name}"),
+                    started_at.as_deref().unwrap_or(""),
+                )
+            }
             GqlContext::StatusContext {
                 context,
                 created_at,
                 ..
-            } => (context.as_str(), created_at.as_deref().unwrap_or("")),
+            } => (context.clone(), created_at.as_deref().unwrap_or("")),
             GqlContext::Other => continue,
         };
         // ISO 8601 timestamps sort as text; ties go to the later entry.
-        match latest.get(name) {
+        match latest.get(&name) {
             Some((seen, _)) if *seen > when => {}
             _ => {
                 latest.insert(name, (when, node));
@@ -621,7 +653,9 @@ impl GqlContext {
                 }
                 match conclusion.as_deref() {
                     Some("SUCCESS" | "NEUTRAL") => CheckOutcome::Passed,
-                    Some("SKIPPED") => CheckOutcome::Skipped,
+                    // Cut short by a failing sibling or a newer run: not a
+                    // result of its own.
+                    Some("SKIPPED" | "CANCELLED" | "STALE") => CheckOutcome::Skipped,
                     None => CheckOutcome::Pending,
                     Some(_) => CheckOutcome::Failed,
                 }
@@ -1235,11 +1269,17 @@ mod tests {
                 {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-09-29T10:00:00Z"},
                 {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-09-29T09:00:00Z"},
                 {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-09-29T10:00:00Z"},
+                {"__typename": "CheckRun", "name": "build-and-test", "status": "COMPLETED", "conclusion": "SUCCESS", "startedAt": "2026-09-29T10:00:00Z",
+                 "checkSuite": {"workflowRun": {"workflow": {"name": "PostgreSQL Tests"}}}},
+                {"__typename": "CheckRun", "name": "build-and-test", "status": "COMPLETED", "conclusion": "CANCELLED", "startedAt": "2026-09-29T10:00:00Z",
+                 "checkSuite": {"workflowRun": {"workflow": {"name": "0FC Tests"}}}},
                 {"__typename": "StatusContext", "context": "ci/external", "state": "SUCCESS", "createdAt": "2026-09-29T09:00:00Z"}]}}}}]}}"#;
         let c = serde_json::from_str::<GqlPr>(json)
             .unwrap()
             .into_checks(Utc::now());
-        assert_eq!((c.passed, c.failed, c.pending, c.total), (3, 0, 0, 3));
+        // Two workflows share a job name and stay apart; the cancelled one
+        // counts for nothing.
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (4, 0, 0, 4));
     }
 
     #[test]
