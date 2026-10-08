@@ -79,6 +79,11 @@ lunch-tray --hidden   # tray icon only
 lunch-tray --popover  # open the compact popover
 ```
 
+Opening a window that is already open brings it to the front. Wayland may
+refuse a focus request that did not come from a click inside the app, so
+when focus does not arrive the window reopens itself, which does land on
+top.
+
 Left-click the tray icon to toggle the popover. It closes when the pointer
 has been inside it and focus moves elsewhere, on Escape, or with its close
 button. The expand button in its header opens the full window. Closing any window keeps the app in the tray. Quit from

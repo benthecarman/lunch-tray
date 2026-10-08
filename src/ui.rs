@@ -16,7 +16,7 @@ use crate::config::APP_ID;
 use crate::model::{
     MergeState, Origin, RemoteKind, RemoteState, Rung, Sections, Task, TaskState, ThemePref,
 };
-use crate::shared::{Notice, NoticeKind, SharedRef, UiRequest, WindowMode};
+use crate::shared::{MainCmd, Notice, NoticeKind, SharedRef, UiRequest, WindowMode};
 use crate::style::{
     self, Palette, RADIUS, WINDOW_RADIUS, danger_button, icon_button, icons, primary_button,
     section_style, soft_count, tint, title_style,
@@ -127,6 +127,8 @@ pub struct App {
     was_focused: bool,
     armed: bool,
     last_focus: Option<bool>,
+    /// A raise was asked for; if focus has not arrived by then, reopen.
+    raise_deadline: Option<std::time::Instant>,
     /// Development aid: `LUNCH_TRAY_SCREENSHOT=file.png` saves the window
     /// after a few frames and quits.
     screenshot: Option<(std::path::PathBuf, u32)>,
@@ -172,6 +174,7 @@ impl App {
             was_focused: false,
             armed: false,
             last_focus: None,
+            raise_deadline: None,
             screenshot: std::env::var_os("LUNCH_TRAY_SCREENSHOT")
                 .map(|p| (std::path::PathBuf::from(p), 0)),
         };
@@ -410,6 +413,39 @@ impl eframe::App for App {
         }
     }
 
+    /// Runs before every UI pass, and on its own while the window is
+    /// covered or minimized, when eframe skips the UI pass entirely. The
+    /// raise fallback lives here so a hidden window can still reopen.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let pending_raise = {
+            let mut s = self.shared.lock().unwrap();
+            let before = s.ui_requests.len();
+            s.ui_requests.retain(|r| !matches!(r, UiRequest::Raise));
+            before != s.ui_requests.len()
+        };
+        if pending_raise {
+            self.raise_deadline = Some(std::time::Instant::now() + Duration::from_millis(400));
+        }
+        let Some(deadline) = self.raise_deadline else {
+            return;
+        };
+        let focused = ctx.input(|i| i.viewport().focused);
+        if focused == Some(true) {
+            self.raise_deadline = None;
+        } else if std::time::Instant::now() >= deadline {
+            // The compositor did not hand us focus. A fresh window opens on
+            // top, so reopen in the same mode.
+            log::debug!("raise refused, reopening the {:?} window", self.mode);
+            self.raise_deadline = None;
+            let s = self.shared.lock().unwrap();
+            let _ = s.main_tx.send(MainCmd::OpenWindow(self.mode));
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         let frame = {
@@ -420,11 +456,16 @@ impl eframe::App for App {
             }
             // Requests are for the full window; the popover leaves them
             // queued for it.
-            let requests = if self.mode == WindowMode::Full {
-                std::mem::take(&mut s.ui_requests)
-            } else {
-                Vec::new()
-            };
+            // The add dialog belongs to the full window; the popover leaves
+            // that request queued for it. A raise applies to either.
+            let mut requests = std::mem::take(&mut s.ui_requests);
+            if self.mode == WindowMode::Popover {
+                let (mine, theirs): (Vec<_>, Vec<_>) = requests
+                    .into_iter()
+                    .partition(|r| matches!(r, UiRequest::Raise));
+                s.ui_requests = theirs;
+                requests = mine;
+            }
             let pref = s.store.settings().theme;
             let system = s.system_theme;
             let now = std::time::Instant::now();
@@ -464,6 +505,7 @@ impl eframe::App for App {
             for r in requests {
                 match r {
                     UiRequest::OpenAddDialog => self.modal = Some(new_task_modal()),
+                    UiRequest::Raise => {}
                 }
             }
             f

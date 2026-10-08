@@ -72,6 +72,10 @@ pub enum MainCmd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiRequest {
     OpenAddDialog,
+    /// Bring the window to the front. On Wayland a focus request without
+    /// an activation token may be refused, in which case the window
+    /// reopens itself, which does land on top.
+    Raise,
 }
 
 pub struct Shared {
@@ -118,11 +122,16 @@ impl Shared {
 
     /// Bring a window of `mode` up: focus it if it is already open, switch
     /// if a different mode is open, or ask the main thread to open one.
-    pub fn open_window(&self, mode: WindowMode) {
+    pub fn open_window(&mut self, mode: WindowMode) {
+        log::debug!(
+            "open {mode:?} requested; current window: {:?}",
+            self.window_mode
+        );
         match (&self.ctx, self.window_mode) {
             (Some(ctx), Some(current)) if current == mode => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.request_repaint();
+                self.ui_requests.push(UiRequest::Raise);
             }
             (Some(ctx), _) => {
                 let _ = self.main_tx.send(MainCmd::OpenWindow(mode));
@@ -136,7 +145,7 @@ impl Shared {
     }
 
     /// Left click on the tray icon: toggle the popover.
-    pub fn toggle_popover(&self) {
+    pub fn toggle_popover(&mut self) {
         match (&self.ctx, self.window_mode) {
             (Some(ctx), Some(WindowMode::Popover)) => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
