@@ -87,6 +87,9 @@ pub struct Shared {
     pub ctx: Option<egui::Context>,
     pub window_mode: Option<WindowMode>,
     pub ui_requests: Vec<UiRequest>,
+    /// XDG activation token from the tray host, good for the next window
+    /// raise. Single use.
+    pub activation_token: Option<String>,
     pub tray: TrayLink,
     pub main_tx: Sender<MainCmd>,
     pub sync_tx: Sender<SyncCmd>,

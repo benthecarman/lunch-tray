@@ -74,6 +74,16 @@ impl ksni::Tray for TrayApp {
             .toggle_popover();
     }
 
+    /// The host sends this right before `activate` or a menu event. Keep it
+    /// for the window to use; see `activate.rs`.
+    fn provide_xdg_activation_token(&mut self, token: String) {
+        log::debug!("activation token received");
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .activation_token = Some(token);
+    }
+
     fn watcher_online(&self) {
         log::info!("tray host is up");
     }

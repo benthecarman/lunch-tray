@@ -1955,8 +1955,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 [[package]]
 name = "ksni"
 version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "814b44c24cd2cb236c3b8a41c7f08237b452a8e76ecaa81f1cec40b5b678215b"
+source = "git+https://github.com/iovxw/ksni?rev=547cc42b9e24ed58c20e7643644184bc2264c9b0#547cc42b9e24ed58c20e7643644184bc2264c9b0"
 dependencies = [
  "async-executor",
  "async-io",
@@ -2076,12 +2075,17 @@ dependencies = [
  "ksni",
  "log",
  "open",
+ "raw-window-handle",
  "ring",
  "serde",
  "serde_json",
  "signal-hook",
  "toml",
  "ureq",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "winit",
  "zbus",
 ]
 

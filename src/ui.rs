@@ -416,13 +416,23 @@ impl eframe::App for App {
     /// Runs before every UI pass, and on its own while the window is
     /// covered or minimized, when eframe skips the UI pass entirely. The
     /// raise fallback lives here so a hidden window can still reopen.
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let pending_raise = {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let (pending_raise, token) = {
             let mut s = self.shared.lock().unwrap();
             let before = s.ui_requests.len();
             s.ui_requests.retain(|r| !matches!(r, UiRequest::Raise));
-            before != s.ui_requests.len()
+            (before != s.ui_requests.len(), s.activation_token.take())
         };
+        // A token from the tray host lets the compositor raise us for real,
+        // whether this window is new or was already open.
+        if let Some(token) = token
+            && let Some(window) = frame.winit_window()
+        {
+            match crate::activate::activate(window, &token) {
+                Ok(()) => log::debug!("asked the compositor to raise the {:?} window", self.mode),
+                Err(e) => log::warn!("could not use the activation token: {e:#}"),
+            }
+        }
         if pending_raise {
             self.raise_deadline = Some(std::time::Instant::now() + Duration::from_millis(400));
         }

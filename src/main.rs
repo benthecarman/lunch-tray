@@ -1,6 +1,7 @@
 //! Lunch Tray: a system tray todo list that follows your pull requests and
 //! issues on GitHub and Forgejo.
 
+mod activate;
 mod brand;
 mod config;
 mod model;
@@ -85,6 +86,7 @@ fn main() -> anyhow::Result<()> {
         ctx: None,
         window_mode: None,
         ui_requests: Vec::new(),
+        activation_token: None,
         tray: TrayLink::new(),
         main_tx: main_tx.clone(),
         sync_tx: sync_tx.clone(),

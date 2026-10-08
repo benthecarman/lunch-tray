@@ -22,7 +22,14 @@ egui = "0.36"
 egui-phosphor = "0.14"
 env_logger = "0.11.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
-ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
+# Master carries Tray::provide_xdg_activation_token, not yet released.
+ksni = { git = "https://github.com/iovxw/ksni", rev = "547cc42b9e24ed58c20e7643644184bc2264c9b0", default-features = false, features = ["async-io", "blocking"] }
+# Only to call xdg_activation_v1.activate on our own window; see activate.rs.
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+winit = "0.30"
 log = "0.4.34"
 open = "5.4.4"
 ring = "0.17"
