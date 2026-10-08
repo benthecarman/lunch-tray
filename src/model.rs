@@ -423,15 +423,18 @@ impl Store {
             .count()
     }
 
-    /// Open pull requests on `provider`/`host` whose check state should be
-    /// fetched now: none saved, the item moved since the last fetch, the
-    /// last result was still pending, or it is older than `CHECKS_MAX_AGE`.
-    /// Most recently updated first.
+    /// Open pull requests on active tasks for `provider`/`host` whose check
+    /// state should be fetched now: none saved, the item moved since the
+    /// last fetch, the last result was still pending, or it is older than
+    /// `CHECKS_MAX_AGE`. Settled and archived tasks are left alone until
+    /// they come back; their badges may be stale meanwhile. Most recently
+    /// updated first.
     pub fn checks_due(&self, provider: Provider, host: &str, now: DateTime<Utc>) -> Vec<RemoteRef> {
         let mut due: Vec<RemoteRef> = self
             .data
             .tasks
             .iter()
+            .filter(|t| t.state == TaskState::Active)
             .filter_map(|t| t.remote())
             .filter(|r| {
                 r.provider == provider
@@ -661,6 +664,7 @@ impl Store {
         t.state = TaskState::Active;
         t.pinned = false;
         t.updated_at = Utc::now();
+        stale_checks(t);
         Ok(true)
     }
 
@@ -805,6 +809,7 @@ impl Store {
                 t.state = TaskState::Active;
                 t.unseen = true;
                 changed = true;
+                stale_checks(t);
                 events.push(SyncEvent::Requested { id: key, label });
             } else if is_open
                 && item.r.remote_updated_at > old.remote_updated_at
@@ -820,6 +825,16 @@ impl Store {
             }
         }
         events
+    }
+}
+
+/// Make a task's check result due on the next sync, for when it comes back
+/// to Active without its remote item having moved.
+fn stale_checks(t: &mut Task) {
+    if let Origin::Remote(r) = &mut t.origin
+        && let Some(c) = &mut r.checks
+    {
+        c.checked_at = DateTime::<Utc>::MIN_UTC;
     }
 }
 
@@ -1364,6 +1379,26 @@ mod tests {
             s.checks_due(Provider::GitHub, "github.com", now + Duration::hours(3))
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn only_active_tasks_have_their_checks_polled() {
+        let mut s = Store::in_memory();
+        let now = Utc::now();
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        s.set_checks(&id, checks(0, MergeState::Clean, now - Duration::hours(2)));
+        assert_eq!(s.checks_due(Provider::GitHub, "github.com", now).len(), 1);
+        s.settle(&id).unwrap();
+        assert!(s.checks_due(Provider::GitHub, "github.com", now).is_empty());
+        s.archive(&id).unwrap();
+        assert!(s.checks_due(Provider::GitHub, "github.com", now).is_empty());
+        // Coming back makes it due at once, even with a fresh result.
+        s.reopen(&id).unwrap();
+        s.set_checks(&id, checks(0, MergeState::Clean, now));
+        s.settle(&id).unwrap();
+        s.reopen(&id).unwrap();
+        assert_eq!(s.checks_due(Provider::GitHub, "github.com", now).len(), 1);
     }
 
     #[test]

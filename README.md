@@ -17,9 +17,14 @@ tray icon.
 - GitHub and Forgejo (or Gitea) sync. New open items become tasks. Closed or
   merged items settle on their own. New activity on a settled item wakes it.
 - CI results and merge state on open pull requests: passed over total
-  checks, and a warning when the branch conflicts with its base. Fetched
-  only when missing, stale, still running, or after the pull request moved,
-  in one GraphQL request per 50 pull requests on GitHub.
+  checks, and a warning when the branch conflicts with its base. Only
+  active tasks are polled, and only when the result is missing, stale,
+  still running, or the pull request moved. Settled and archived tasks
+  keep their last badge until they come back.
+- Light on GitHub's rate limit: searches send the last ETag, so an
+  unchanged answer costs nothing; the quota headers are read on every
+  answer and optional work waits when the last tenth is left; a
+  rate-limit answer pauses that host until the time GitHub gives.
 - Manual tasks with notes and a link.
 - The window is a tray: a mint-grey melamine surface with a recessed
   compartment per section, and mustard for the few things that need

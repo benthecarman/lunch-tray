@@ -1,6 +1,6 @@
 //! Remote providers (GitHub, Forgejo) and the background sync loop.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
@@ -39,6 +39,10 @@ pub trait Forge: Send {
     fn fetch_one(&self, owner: &str, repo: &str, number: u64) -> Result<RemoteItem>;
     /// Repository patterns to ignore.
     fn exclude(&self) -> &[String];
+    /// True when the host's quota is nearly spent; optional work waits.
+    fn quota_low(&self) -> bool {
+        false
+    }
     /// CI and merge state for these open pull requests. Items the forge
     /// cannot answer for are simply left out.
     fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>>;
@@ -73,6 +77,38 @@ struct Http {
     agent: ureq::Agent,
     /// Cookie earned from a proof-of-work gate, if the host has one.
     gate_cookie: Mutex<Option<String>>,
+    /// ETag and body of the last answer per GET URL. A matching `304`
+    /// costs nothing against GitHub's rate limit.
+    etags: Mutex<HashMap<String, (String, String)>>,
+    /// GitHub's own count per quota, read from the latest answer's headers.
+    quotas: Mutex<HashMap<String, Quota>>,
+    /// Set when the host said to stop; nothing is sent before it.
+    paused_until: Mutex<Option<DateTime<Utc>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Quota {
+    limit: u64,
+    remaining: u64,
+    reset: DateTime<Utc>,
+}
+
+/// GitHub's rate-limit headers, when present.
+fn parse_quota(headers: &ureq::http::HeaderMap) -> Option<(String, Quota)> {
+    let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
+    let resource = get("x-ratelimit-resource").unwrap_or("core").to_string();
+    let limit: u64 = get("x-ratelimit-limit")?.parse().ok()?;
+    let remaining: u64 = get("x-ratelimit-remaining")?.parse().ok()?;
+    let reset: i64 = get("x-ratelimit-reset")?.parse().ok()?;
+    let reset = DateTime::from_timestamp(reset, 0)?;
+    Some((
+        resource,
+        Quota {
+            limit,
+            remaining,
+            reset,
+        },
+    ))
 }
 
 impl Http {
@@ -86,7 +122,38 @@ impl Http {
         Http {
             agent,
             gate_cookie: Mutex::new(None),
+            etags: Mutex::new(HashMap::new()),
+            quotas: Mutex::new(HashMap::new()),
+            paused_until: Mutex::new(None),
         }
+    }
+
+    /// True while the host asked us to back off.
+    fn paused(&self) -> Option<DateTime<Utc>> {
+        let mut p = self.paused_until.lock().unwrap_or_else(|e| e.into_inner());
+        match *p {
+            Some(until) if until > Utc::now() => Some(until),
+            Some(_) => {
+                *p = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn pause_until(&self, until: DateTime<Utc>) {
+        *self.paused_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
+    }
+
+    /// True when any quota is in its last tenth. Background work waits
+    /// for the reset so the searches that keep the list current still fit.
+    fn quota_low(&self) -> bool {
+        let now = Utc::now();
+        self.quotas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|q| q.reset > now && q.remaining * 10 < q.limit)
     }
 
     /// GET `url` with `headers` and decode JSON. A 403 carrying a
@@ -116,12 +183,28 @@ impl Http {
         headers: &[(&str, String)],
         body: Option<&serde_json::Value>,
     ) -> Result<T> {
+        if let Some(until) = self.paused() {
+            bail!(
+                "rate limited until {}",
+                until.with_timezone(&chrono::Local).format("%H:%M")
+            );
+        }
+        let method = if body.is_some() { "POST" } else { "GET" };
         for attempt in 0..2 {
             let cookie = self
                 .gate_cookie
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            let cached = if body.is_none() {
+                self.etags
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(url)
+                    .cloned()
+            } else {
+                None
+            };
             let mut resp = match body {
                 None => {
                     let mut req = self.agent.get(url);
@@ -130,6 +213,9 @@ impl Http {
                     }
                     if let Some(c) = &cookie {
                         req = req.header("Cookie", c);
+                    }
+                    if let Some((etag, _)) = &cached {
+                        req = req.header("If-None-Match", etag);
                     }
                     req.call().with_context(|| format!("GET {url}"))?
                 }
@@ -145,6 +231,19 @@ impl Http {
                 }
             };
             let status = resp.status().as_u16();
+            if let Some((resource, quota)) = parse_quota(resp.headers()) {
+                log::trace!("{resource} quota: {}/{}", quota.remaining, quota.limit);
+                self.quotas
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(resource, quota);
+            }
+            if status == 304
+                && let Some((_, text)) = cached
+            {
+                log::debug!("unchanged: {url}");
+                return serde_json::from_str::<T>(&text).with_context(|| format!("decode {url}"));
+            }
             let html = resp
                 .headers()
                 .get("content-type")
@@ -166,15 +265,65 @@ impl Http {
                 }
                 bail!("GET {url}: http status 403");
             }
-            let method = if body.is_some() { "POST" } else { "GET" };
+            if status == 403 || status == 429 {
+                // GitHub says 403 for its primary limit and 403 or 429 for
+                // the secondary one, with a Retry-After. Stop until then.
+                let retry_after = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<i64>().ok());
+                let exhausted = parse_quota(resp.headers())
+                    .filter(|(_, q)| q.remaining == 0)
+                    .map(|(_, q)| q.reset);
+                let message = resp
+                    .body_mut()
+                    .read_to_string()
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                    .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+                    .unwrap_or_default();
+                let until = match (retry_after, exhausted) {
+                    (Some(secs), _) => Some(Utc::now() + chrono::Duration::seconds(secs.max(1))),
+                    (None, Some(reset)) => Some(reset),
+                    (None, None) if message.to_lowercase().contains("rate limit") => {
+                        Some(Utc::now() + chrono::Duration::seconds(60))
+                    }
+                    _ => None,
+                };
+                if let Some(until) = until {
+                    log::warn!("{method} {url}: {status}, backing off until {until}: {message}");
+                    self.pause_until(until);
+                    bail!(
+                        "rate limited until {}",
+                        until.with_timezone(&chrono::Local).format("%H:%M")
+                    );
+                }
+                return Err(ureq::Error::StatusCode(status))
+                    .with_context(|| format!("{method} {url}: {message}"));
+            }
             if status >= 400 {
                 return Err(ureq::Error::StatusCode(status))
                     .with_context(|| format!("{method} {url}"));
             }
-            return resp
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let text = resp
                 .body_mut()
-                .read_json::<T>()
-                .with_context(|| format!("decode {url}"));
+                .read_to_string()
+                .with_context(|| format!("read {url}"))?;
+            if body.is_none()
+                && let Some(etag) = etag
+            {
+                self.etags
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(url.to_string(), (etag, text.clone()));
+            }
+            return serde_json::from_str::<T>(&text).with_context(|| format!("decode {url}"));
         }
         bail!("GET {url}: the proof-of-work gate did not accept the answer")
     }
@@ -464,6 +613,10 @@ impl Forge for GitHub {
         &self.exclude
     }
 
+    fn quota_low(&self) -> bool {
+        self.http.quota_low()
+    }
+
     /// Batches of `GRAPHQL_BATCH` pull requests per GraphQL request: each
     /// alias asks for the merge state and the check rollup of the head
     /// commit. A batch that fails is split in half and retried, down to
@@ -498,6 +651,10 @@ impl Forge for GitHub {
                     urlencode(q),
                     page
                 );
+                // A short gap keeps bursts under GitHub's secondary limit.
+                if !out.is_empty() {
+                    std::thread::sleep(Duration::from_millis(150));
+                }
                 let res: GhSearch = self.get(&url)?;
                 let n = res.items.len();
                 out.extend(res.items.into_iter().filter_map(|i| self.convert(i)));
@@ -1078,7 +1235,12 @@ pub fn sync_once(
             log::warn!("{msg}");
             errors.push(msg);
         }
-        if checks && let Err(e) = sync_checks(forge.as_ref(), shared) {
+        if checks && forge.quota_low() {
+            log::info!(
+                "{} quota is low, skipping CI checks this poll",
+                forge.host()
+            );
+        } else if checks && let Err(e) = sync_checks(forge.as_ref(), shared) {
             log::warn!(
                 "{} {} checks: {e:#}",
                 forge.provider().label(),
@@ -1127,6 +1289,14 @@ fn sync_forge(
             })
             .collect()
     };
+    if !to_check.is_empty() && forge.quota_low() {
+        log::info!(
+            "{} quota is low, skipping {} individual checks",
+            forge.host(),
+            to_check.len()
+        );
+        to_check.clear();
+    }
     if to_check.len() > MAX_INDIVIDUAL_CHECKS {
         let start = (round * MAX_INDIVIDUAL_CHECKS) % to_check.len();
         to_check.rotate_left(start);
@@ -1301,6 +1471,35 @@ mod tests {
             .unwrap()
             .into_checks(Utc::now());
         assert_eq!((c.passed, c.failed, c.pending, c.total), (1, 0, 0, 1));
+    }
+
+    #[test]
+    fn rate_limit_headers_are_read() {
+        let mut h = ureq::http::HeaderMap::new();
+        h.insert("x-ratelimit-resource", "search".parse().unwrap());
+        h.insert("x-ratelimit-limit", "30".parse().unwrap());
+        h.insert("x-ratelimit-remaining", "2".parse().unwrap());
+        h.insert("x-ratelimit-reset", "1800000000".parse().unwrap());
+        let (resource, q) = parse_quota(&h).unwrap();
+        assert_eq!(resource, "search");
+        assert_eq!((q.limit, q.remaining), (30, 2));
+        assert_eq!(q.reset.timestamp(), 1_800_000_000);
+        assert!(parse_quota(&ureq::http::HeaderMap::new()).is_none());
+
+        let http = Http::new();
+        assert!(!http.quota_low());
+        http.quotas.lock().unwrap().insert(
+            "core".into(),
+            Quota {
+                limit: 5000,
+                remaining: 400,
+                reset: Utc::now() + chrono::Duration::minutes(10),
+            },
+        );
+        assert!(http.quota_low());
+        assert!(http.paused().is_none());
+        http.pause_until(Utc::now() + chrono::Duration::minutes(1));
+        assert!(http.paused().is_some());
     }
 
     #[test]
