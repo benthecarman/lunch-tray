@@ -55,6 +55,7 @@ pub fn run_window(shared: SharedRef, mode: WindowMode, open_add: bool) -> eframe
     let options = eframe::NativeOptions {
         viewport,
         run_and_return: true,
+        renderer: eframe::Renderer::Glow,
         persist_window: false,
         centered: true,
         ..Default::default()
@@ -688,7 +689,7 @@ impl eframe::App for App {
         }
     }
 
-    fn on_exit(&mut self) {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.heartbeat.alive.store(false, Ordering::Relaxed);
         let mut s = self.shared.lock().unwrap();
         s.window = None;

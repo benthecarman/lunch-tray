@@ -17,7 +17,9 @@ publish = false
 anyhow = "1.0.104"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "7.0.0"
-eframe = "0.36"
+# glow instead of the default wgpu renderer: a fraction of the memory for a
+# UI this simple.
+eframe = { version = "0.36", default-features = false, features = ["accesskit", "default_fonts", "glow", "links", "wayland", "x11"] }
 egui = "0.36"
 egui-phosphor = "0.14"
 env_logger = "0.11.11"
