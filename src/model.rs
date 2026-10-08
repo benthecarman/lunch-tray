@@ -600,6 +600,16 @@ impl Store {
         Ok(true)
     }
 
+    /// Clear the new-activity marker everywhere. Returns how many changed.
+    pub fn mark_all_seen(&mut self) -> usize {
+        self.data
+            .tasks
+            .iter_mut()
+            .filter(|t| t.unseen)
+            .map(|t| t.unseen = false)
+            .count()
+    }
+
     pub fn mark_seen(&mut self, id: &str) -> bool {
         match self.get_mut(id) {
             Some(t) if t.unseen => {
@@ -1378,6 +1388,22 @@ mod tests {
                 .passed,
             3
         );
+    }
+
+    #[test]
+    fn mark_all_seen_clears_every_marker() {
+        let mut s = Store::in_memory();
+        s.apply_remote(
+            OnClose::Settle,
+            &[
+                remote(1, RemoteState::Open, t0()),
+                remote(2, RemoteState::Open, t0()),
+            ],
+        );
+        assert_eq!(s.count_unseen(), 2);
+        assert_eq!(s.mark_all_seen(), 2);
+        assert_eq!(s.count_unseen(), 0);
+        assert_eq!(s.mark_all_seen(), 0);
     }
 
     #[test]

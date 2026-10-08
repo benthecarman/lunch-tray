@@ -166,6 +166,8 @@ Where a row shows, evaluated in order: archived, then pinned, then the state.
 - **Reopen** moves the task back to Active. It never restores a pin.
 - **Archive** keeps everything else as it is. Archiving an archived task does
   nothing. An archived task with an open remote item wakes on new activity.
+- **Mark all as read**, in the window menu, clears the new-activity dot on
+  every task and the badge on the tray icon.
 - **Archive older than a year**, in the window menu, archives every unpinned
   task whose item has not moved in a year, after asking. They come back on
   activity like any archived task.

@@ -815,6 +815,18 @@ impl App {
             }
             ui.separator();
             if ui
+                .button(format!("{}  Mark all as read", icons::CHECKS))
+                .clicked()
+            {
+                let mut s = self.shared.lock().unwrap();
+                let n = s.store.mark_all_seen();
+                if n > 0 {
+                    s.save_store();
+                    s.notify();
+                }
+                ui.close();
+            }
+            if ui
                 .button(format!("{}  Archive older than a year", icons::ARCHIVE))
                 .clicked()
             {
