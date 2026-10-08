@@ -2,6 +2,8 @@
 //! and the compact popover opened from the tray.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -129,6 +131,12 @@ pub struct App {
     last_focus: Option<bool>,
     /// A raise was asked for; if focus has not arrived by then, reopen.
     raise_deadline: Option<std::time::Instant>,
+    opened_at: std::time::Instant,
+    dev_minimized: bool,
+    /// Wakes the event loop from outside while the window is hidden or a
+    /// raise is pending. Repaint requests made inside a logic-only tick are
+    /// dropped by eframe, so they have to come from another thread.
+    heartbeat: Arc<Heartbeat>,
     /// Development aid: `LUNCH_TRAY_SCREENSHOT=file.png` saves the window
     /// after a few frames and quits.
     screenshot: Option<(std::path::PathBuf, u32)>,
@@ -175,6 +183,9 @@ impl App {
             armed: false,
             last_focus: None,
             raise_deadline: None,
+            opened_at: std::time::Instant::now(),
+            dev_minimized: false,
+            heartbeat: Heartbeat::start(cc.egui_ctx.clone()),
             screenshot: std::env::var_os("LUNCH_TRAY_SCREENSHOT")
                 .map(|p| (std::path::PathBuf::from(p), 0)),
         };
@@ -378,6 +389,38 @@ impl App {
     }
 }
 
+/// A thread that pokes the egui context from outside while the window is
+/// hidden or a raise is in flight. See `App::logic`.
+struct Heartbeat {
+    alive: AtomicBool,
+    hidden: AtomicBool,
+    busy: AtomicBool,
+}
+
+impl Heartbeat {
+    fn start(ctx: egui::Context) -> Arc<Self> {
+        let hb = Arc::new(Heartbeat {
+            alive: AtomicBool::new(true),
+            hidden: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
+        });
+        let h = hb.clone();
+        std::thread::Builder::new()
+            .name("heartbeat".into())
+            .spawn(move || {
+                while h.alive.load(Ordering::Relaxed) {
+                    let busy = h.busy.load(Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(if busy { 60 } else { 250 }));
+                    if h.hidden.load(Ordering::Relaxed) || busy {
+                        ctx.request_repaint();
+                    }
+                }
+            })
+            .expect("spawn heartbeat");
+        hb
+    }
+}
+
 /// Apply the result of a transition: persist on change, show errors.
 fn finish(s: &mut crate::shared::Shared, r: Result<bool, String>) -> bool {
     match r {
@@ -417,19 +460,30 @@ impl eframe::App for App {
     /// covered or minimized, when eframe skips the UI pass entirely. The
     /// raise fallback lives here so a hidden window can still reopen.
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // While minimized or covered no UI pass runs, and a viewport command
+        // such as Close only takes effect on the tick after it was issued.
+        // The heartbeat keeps ticks coming so quit and reopen cannot stall.
+        let visible = ctx.input(|i| i.viewport().visible().unwrap_or(true));
+        self.heartbeat.hidden.store(!visible, Ordering::Relaxed);
         let (pending_raise, token) = {
             let mut s = self.shared.lock().unwrap();
+            if s.window.is_none() {
+                s.window = frame.winit_window().cloned();
+            }
             let before = s.ui_requests.len();
             s.ui_requests.retain(|r| !matches!(r, UiRequest::Raise));
             (before != s.ui_requests.len(), s.activation_token.take())
         };
-        // A token from the tray host lets the compositor raise us for real,
-        // whether this window is new or was already open.
+        // A token left over from the click that opened this window lets the
+        // compositor focus it instead of only flagging it.
         if let Some(token) = token
             && let Some(window) = frame.winit_window()
         {
             match crate::activate::activate(window, &token) {
-                Ok(()) => log::debug!("asked the compositor to raise the {:?} window", self.mode),
+                Ok(()) => log::debug!(
+                    "asked the compositor to focus the new {:?} window",
+                    self.mode
+                ),
                 Err(e) => log::warn!("could not use the activation token: {e:#}"),
             }
         }
@@ -437,22 +491,22 @@ impl eframe::App for App {
             self.raise_deadline = Some(std::time::Instant::now() + Duration::from_millis(400));
         }
         let Some(deadline) = self.raise_deadline else {
+            self.heartbeat.busy.store(false, Ordering::Relaxed);
             return;
         };
+        self.heartbeat.busy.store(true, Ordering::Relaxed);
         let focused = ctx.input(|i| i.viewport().focused);
         if focused == Some(true) {
             self.raise_deadline = None;
         } else if std::time::Instant::now() >= deadline {
             // The compositor did not hand us focus. A fresh window opens on
-            // top, so reopen in the same mode.
+            // top, so reopen in the same mode. The close takes effect on a
+            // later tick, which the heartbeat provides.
             log::debug!("raise refused, reopening the {:?} window", self.mode);
             self.raise_deadline = None;
             let s = self.shared.lock().unwrap();
             let _ = s.main_tx.send(MainCmd::OpenWindow(self.mode));
             ctx.send_viewport_cmd(ViewportCommand::Close);
-            ctx.request_repaint();
-        } else {
-            ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
 
@@ -524,6 +578,21 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
         self.screenshot_hook(ctx);
+        // Development aid: `LUNCH_TRAY_MINIMIZE_AFTER_MS=n` minimizes the
+        // window once, to test what happens while it is minimized.
+        if let Some(ms) = std::env::var("LUNCH_TRAY_MINIMIZE_AFTER_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            && !self.dev_minimized
+        {
+            if self.opened_at.elapsed() >= Duration::from_millis(ms) {
+                self.dev_minimized = true;
+                log::debug!("dev: minimizing");
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
 
         let p = Palette::for_theme(ctx.theme());
         let popover = self.mode == WindowMode::Popover;
@@ -620,7 +689,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.heartbeat.alive.store(false, Ordering::Relaxed);
         let mut s = self.shared.lock().unwrap();
+        s.window = None;
         s.ctx = None;
         s.window_mode = None;
     }

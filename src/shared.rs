@@ -90,6 +90,10 @@ pub struct Shared {
     /// XDG activation token from the tray host, good for the next window
     /// raise. Single use.
     pub activation_token: Option<String>,
+    /// The open window's native handle, for raising it from other threads.
+    /// A minimized Wayland window gets no event-loop ticks at all, so the
+    /// raise must not go through the loop.
+    pub window: Option<std::sync::Arc<winit::window::Window>>,
     pub tray: TrayLink,
     pub main_tx: Sender<MainCmd>,
     pub sync_tx: Sender<SyncCmd>,
@@ -130,6 +134,9 @@ impl Shared {
             "open {mode:?} requested; current window: {:?}",
             self.window_mode
         );
+        if self.raise_existing() {
+            return;
+        }
         match (&self.ctx, self.window_mode) {
             (Some(ctx), Some(current)) if current == mode => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -147,15 +154,41 @@ impl Shared {
         }
     }
 
-    /// Left click on the tray icon: toggle the popover.
-    pub fn toggle_popover(&mut self) {
-        match (&self.ctx, self.window_mode) {
-            (Some(ctx), Some(WindowMode::Popover)) => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                ctx.request_repaint();
+    /// With a token from the tray host and a window already open, in any
+    /// mode, ask the compositor to bring that window forward. Returns true
+    /// when that was done.
+    fn raise_existing(&mut self) -> bool {
+        let (Some(window), Some(token)) = (self.window.clone(), self.activation_token.take())
+        else {
+            return false;
+        };
+        match crate::activate::activate(&window, &token) {
+            Ok(()) => {
+                log::debug!("asked the compositor to raise the open window");
+                if let Some(ctx) = &self.ctx {
+                    ctx.request_repaint();
+                }
+                true
             }
-            _ => self.open_window(WindowMode::Popover),
+            Err(e) => {
+                log::warn!("could not use the activation token: {e:#}");
+                false
+            }
         }
+    }
+
+    /// Left click on the tray icon: close the popover if it is showing,
+    /// bring back whatever window is open, or open the popover.
+    pub fn toggle_popover(&mut self) {
+        if let (Some(ctx), Some(WindowMode::Popover)) = (&self.ctx, self.window_mode) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+            return;
+        }
+        if self.window.is_some() && self.raise_existing() {
+            return;
+        }
+        self.open_window(WindowMode::Popover);
     }
 
     pub fn quit(&self) {
@@ -163,6 +196,14 @@ impl Shared {
         if let Some(ctx) = &self.ctx {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             ctx.request_repaint();
+            // A minimized window never gets the tick that closes it. The
+            // store is saved on every change, so after a grace period just
+            // go.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                log::warn!("window did not close in time, exiting");
+                std::process::exit(0);
+            });
         }
     }
 }

@@ -87,6 +87,7 @@ fn main() -> anyhow::Result<()> {
         window_mode: None,
         ui_requests: Vec::new(),
         activation_token: None,
+        window: None,
         tray: TrayLink::new(),
         main_tx: main_tx.clone(),
         sync_tx: sync_tx.clone(),
