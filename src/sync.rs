@@ -571,9 +571,101 @@ impl GitHub {
     }
 }
 
+impl GitHub {
+    fn convert_node(&self, node: GqlSearchNode) -> Option<RemoteItem> {
+        let (kind, state, draft, c) = match node {
+            GqlSearchNode::PullRequest { is_draft, common } => {
+                let state = match common.state.as_str() {
+                    "OPEN" => RemoteState::Open,
+                    "MERGED" => RemoteState::Merged,
+                    _ => RemoteState::Closed,
+                };
+                (RemoteKind::PullRequest, state, is_draft, common)
+            }
+            GqlSearchNode::Issue { common } => {
+                let state = if common.state == "OPEN" {
+                    RemoteState::Open
+                } else {
+                    RemoteState::Closed
+                };
+                (RemoteKind::Issue, state, false, common)
+            }
+            GqlSearchNode::Other => return None,
+        };
+        let (owner, repo) = c.repository.name_with_owner.split_once('/')?;
+        Some(RemoteItem {
+            r: RemoteRef {
+                provider: Provider::GitHub,
+                host: self.host.clone(),
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                number: c.number,
+                kind,
+                url: c.url,
+                author: c.author.map(|a| a.login).unwrap_or_default(),
+                state,
+                draft,
+                remote_updated_at: parse_time(&c.updated_at),
+                in_queries: true,
+                checks: None,
+            },
+            title: c.title,
+        })
+    }
+}
+
 #[derive(Deserialize)]
-struct GhSearch {
-    items: Vec<GhIssue>,
+struct GqlSearchPage {
+    #[serde(rename = "pageInfo")]
+    page_info: GqlPageInfo,
+    nodes: Vec<GqlSearchNode>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum GqlSearchNode {
+    PullRequest {
+        #[serde(rename = "isDraft")]
+        is_draft: bool,
+        #[serde(flatten)]
+        common: GqlSearchCommon,
+    },
+    Issue {
+        #[serde(flatten)]
+        common: GqlSearchCommon,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlSearchCommon {
+    number: u64,
+    title: String,
+    url: String,
+    state: String,
+    updated_at: String,
+    author: Option<GqlLogin>,
+    repository: GqlRepoName,
+}
+
+#[derive(Deserialize)]
+struct GqlLogin {
+    login: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GqlRepoName {
+    name_with_owner: String,
 }
 
 #[derive(Deserialize)]
@@ -641,24 +733,43 @@ impl Forge for GitHub {
         Ok(out)
     }
 
+    /// The configured searches through GraphQL: one point of the hourly
+    /// budget per page, rather than one of the 30-a-minute REST search
+    /// quota. The query syntax is the same.
     fn fetch_open(&self) -> Result<Vec<RemoteItem>> {
+        const QUERY: &str = "query($q: String!, $after: String) { \
+            search(query: $q, type: ISSUE, first: 100, after: $after) { \
+            pageInfo { hasNextPage endCursor } nodes { __typename \
+            ... on PullRequest { number title url state updatedAt isDraft \
+            author { login } repository { nameWithOwner } } \
+            ... on Issue { number title url state updatedAt \
+            author { login } repository { nameWithOwner } } } } }";
         let mut out = Vec::new();
         for q in &self.queries {
-            for page in 1..=MAX_PAGES {
-                let url = format!(
-                    "{}/search/issues?q={}&per_page=100&page={}",
-                    self.api_url,
-                    urlencode(q),
-                    page
-                );
-                // A short gap keeps bursts under GitHub's secondary limit.
-                if !out.is_empty() {
-                    std::thread::sleep(Duration::from_millis(150));
-                }
-                let res: GhSearch = self.get(&url)?;
-                let n = res.items.len();
-                out.extend(res.items.into_iter().filter_map(|i| self.convert(i)));
-                if n < 100 {
+            let mut after: Option<String> = None;
+            for _ in 0..MAX_PAGES {
+                let reply: GqlReply = self.http.post_json(
+                    &self.graphql_url(),
+                    &[("Authorization", format!("Bearer {}", self.token))],
+                    &serde_json::json!({ "query": QUERY, "variables": { "q": q, "after": after } }),
+                )?;
+                let page: GqlSearchPage = match reply.data.and_then(|d| d.get("search").cloned()) {
+                    Some(v) if !v.is_null() => {
+                        serde_json::from_value(v).context("decode search")?
+                    }
+                    _ => {
+                        let why = reply
+                            .errors
+                            .and_then(|e| e.into_iter().next())
+                            .map(|e| e.message)
+                            .unwrap_or_else(|| "no data".into());
+                        bail!("search {q:?}: {why}");
+                    }
+                };
+                out.extend(page.nodes.into_iter().filter_map(|n| self.convert_node(n)));
+                if page.page_info.has_next_page && page.page_info.end_cursor.is_some() {
+                    after = page.page_info.end_cursor;
+                } else {
                     break;
                 }
             }
@@ -1402,6 +1513,40 @@ mod tests {
         assert_eq!(item.r.kind, RemoteKind::PullRequest);
         assert_eq!(item.r.state, RemoteState::Merged);
         assert_eq!(item.r.key(), "github:github.com/o/r#7");
+    }
+
+    #[test]
+    fn graphql_search_nodes_convert() {
+        let gh = GitHub {
+            api_url: "https://api.github.com".into(),
+            host: "github.com".into(),
+            token: String::new(),
+            queries: vec![],
+            exclude: vec![],
+            http: Http::new(),
+        };
+        let json = r#"{"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": [
+            {"__typename": "PullRequest", "number": 7, "title": "Fix it", "url": "https://github.com/o/r/pull/7",
+             "state": "MERGED", "updatedAt": "2026-02-03T04:05:06Z", "isDraft": true,
+             "author": {"login": "ben"}, "repository": {"nameWithOwner": "o/r"}},
+            {"__typename": "Issue", "number": 9, "title": "Bug", "url": "https://github.com/o/r/issues/9",
+             "state": "OPEN", "updatedAt": "2026-02-03T04:05:06Z",
+             "author": null, "repository": {"nameWithOwner": "o/r"}},
+            {"__typename": "Discussion"}]}"#;
+        let page: GqlSearchPage = serde_json::from_str(json).unwrap();
+        let items: Vec<RemoteItem> = page
+            .nodes
+            .into_iter()
+            .filter_map(|n| gh.convert_node(n))
+            .collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].r.kind, RemoteKind::PullRequest);
+        assert_eq!(items[0].r.state, RemoteState::Merged);
+        assert!(items[0].r.draft);
+        assert_eq!(items[0].r.key(), "github:github.com/o/r#7");
+        assert_eq!(items[1].r.kind, RemoteKind::Issue);
+        assert_eq!(items[1].r.author, "");
+        assert!(items[1].r.in_queries);
     }
 
     #[test]
