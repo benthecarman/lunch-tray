@@ -117,6 +117,11 @@ impl Checks {
 /// conflicts caused by other merges still surface.
 pub const CHECKS_MAX_AGE: chrono::Duration = chrono::Duration::minutes(30);
 
+/// GitHub search sometimes returns a short result without an error, for one
+/// or two polls. An item must be missing this many polls in a row before it
+/// leaves the queries, so such a gap does not settle it and then mark it new.
+pub const QUERY_MISSES_TO_LEAVE: u32 = 3;
+
 /// A pull request or issue on a remote forge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteRef {
@@ -137,6 +142,10 @@ pub struct RemoteRef {
     /// item that leaves the queries no longer needs you.
     #[serde(default = "default_true")]
     pub in_queries: bool,
+    /// Polls in a row that the queries left out this item while it was
+    /// still in them. See `QUERY_MISSES_TO_LEAVE`.
+    #[serde(default)]
+    pub query_misses: u32,
     /// CI and merge state, kept across syncs and refreshed only when due.
     #[serde(default)]
     pub checks: Option<Checks>,
@@ -748,6 +757,14 @@ impl Store {
             // Sync results carry no check state; keep what we have.
             let mut fresh = item.r.clone();
             fresh.checks = old.checks.clone();
+            if fresh.state == RemoteState::Open && old.in_queries && !fresh.in_queries {
+                let misses = old.query_misses + 1;
+                if misses < QUERY_MISSES_TO_LEAVE {
+                    fresh.in_queries = true;
+                    fresh.query_misses = misses;
+                }
+            }
+            let in_queries = fresh.in_queries;
             if old != fresh {
                 t.origin = Origin::Remote(fresh);
                 changed = true;
@@ -791,7 +808,7 @@ impl Store {
                 });
             } else if is_open
                 && old.in_queries
-                && !item.r.in_queries
+                && !in_queries
                 && t.state == TaskState::Active
                 && !t.pinned
             {
@@ -801,11 +818,7 @@ impl Store {
                 t.unseen = false;
                 changed = true;
                 events.push(SyncEvent::Released { id: key, label });
-            } else if is_open
-                && !old.in_queries
-                && item.r.in_queries
-                && t.state != TaskState::Active
-            {
+            } else if is_open && !old.in_queries && in_queries && t.state != TaskState::Active {
                 t.state = TaskState::Active;
                 t.unseen = true;
                 changed = true;
@@ -868,6 +881,7 @@ mod tests {
                 draft: false,
                 remote_updated_at: updated,
                 in_queries: true,
+                query_misses: 0,
                 checks: None,
             },
             title: format!("PR {number}"),
@@ -1039,9 +1053,7 @@ mod tests {
         let mut s = Store::in_memory();
         s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
-        let mut out = remote(1, RemoteState::Open, t0());
-        out.r.in_queries = false;
-        s.apply_remote(OnClose::Settle, &[out]);
+        leave_queries(&mut s, 1, t0());
         s.archive(&id).unwrap();
         let ev = s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         assert!(matches!(ev.as_slice(), [SyncEvent::Requested { .. }]));
@@ -1169,13 +1181,62 @@ mod tests {
         item
     }
 
+    /// Drop an item from the queries for enough polls that it leaves them.
+    fn leave_queries(s: &mut Store, number: u64, updated: DateTime<Utc>) -> Vec<SyncEvent> {
+        let mut ev = Vec::new();
+        for _ in 0..QUERY_MISSES_TO_LEAVE {
+            ev = s.apply_remote(OnClose::Settle, &[dropped(number, updated)]);
+        }
+        ev
+    }
+
+    #[test]
+    fn a_short_gap_in_the_queries_changes_nothing() {
+        let mut s = Store::in_memory();
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        s.mark_seen(&id);
+        for _ in 1..QUERY_MISSES_TO_LEAVE {
+            assert!(
+                s.apply_remote(OnClose::Settle, &[dropped(1, t0())])
+                    .is_empty()
+            );
+        }
+        assert!(
+            s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())])
+                .is_empty()
+        );
+        let t = s.get(&id).unwrap();
+        assert_eq!(t.rung(), Rung::Active);
+        assert!(!t.unseen);
+        // The count starts again once the search returns the item.
+        let ev = leave_queries(&mut s, 1, t0());
+        assert!(matches!(ev.as_slice(), [SyncEvent::Released { .. }]));
+    }
+
+    #[test]
+    fn a_settled_task_stays_quiet_through_a_short_gap() {
+        let mut s = Store::in_memory();
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        s.settle(&id).unwrap();
+        s.apply_remote(OnClose::Settle, &[dropped(1, t0())]);
+        assert!(
+            s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())])
+                .is_empty()
+        );
+        let t = s.get(&id).unwrap();
+        assert_eq!(t.rung(), Rung::Settled);
+        assert!(!t.unseen);
+    }
+
     #[test]
     fn leaving_the_queries_settles_an_active_task_once() {
         let mut s = Store::in_memory();
         s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         // You reviewed it: the review request is gone, the PR is still open.
-        let ev = s.apply_remote(OnClose::Settle, &[dropped(1, t0())]);
+        let ev = leave_queries(&mut s, 1, t0());
         assert!(matches!(ev.as_slice(), [SyncEvent::Released { .. }]));
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
         // Still out of the queries, no activity: nothing happens.
@@ -1198,7 +1259,7 @@ mod tests {
         let mut s = Store::in_memory();
         s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
-        s.apply_remote(OnClose::Settle, &[dropped(1, t0())]);
+        leave_queries(&mut s, 1, t0());
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
         // Review requested again.
         let ev = s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
@@ -1214,10 +1275,7 @@ mod tests {
         s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         s.set_pinned(&id, true).unwrap();
-        assert!(
-            s.apply_remote(OnClose::Settle, &[dropped(1, t0())])
-                .is_empty()
-        );
+        assert!(leave_queries(&mut s, 1, t0()).is_empty());
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
         assert!(s.get(&id).unwrap().pinned);
     }
