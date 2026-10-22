@@ -1575,8 +1575,9 @@ struct Badge {
 }
 
 /// CI result and merge state of an open pull request, shown after the
-/// title: passed over total in green, red while something failed, mustard
-/// while runs are going, and a warning when the branch has conflicts.
+/// title: finished over total checks, red once any check failed, mustard
+/// while runs are going, green when all are done, and a warning when the
+/// branch has conflicts. Failure wins over progress, as in Paseo.
 fn check_badges(p: &Palette, t: &Task) -> Vec<Badge> {
     let mut out = Vec::new();
     let Some(r) = t.remote() else {
@@ -1605,7 +1606,7 @@ fn check_badges(p: &Palette, t: &Task) -> Vec<Badge> {
             (icons::CHECK_CIRCLE, p.open, "All checks passed".to_string())
         };
         out.push(Badge {
-            text: format!("{icon} {}/{}", c.passed, c.total),
+            text: format!("{icon} {}/{}", c.total.saturating_sub(c.pending), c.total),
             color,
             tip,
         });

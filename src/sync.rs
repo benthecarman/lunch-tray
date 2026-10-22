@@ -48,11 +48,13 @@ pub trait Forge: Send {
     fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>>;
 }
 
-/// Sort CI contexts into passed, failed, or pending buckets. Skipped jobs
-/// never ran, so they count for nothing.
-fn tally(states: impl IntoIterator<Item = CheckOutcome>) -> (u32, u32, u32) {
-    let (mut passed, mut failed, mut pending) = (0, 0, 0);
+/// Count CI contexts as passed, failed, and pending, plus the total.
+/// Skipped and cancelled jobs are finished without passing or failing: they
+/// count only in the total, as in Paseo.
+fn tally(states: impl IntoIterator<Item = CheckOutcome>) -> (u32, u32, u32, u32) {
+    let (mut passed, mut failed, mut pending, mut total) = (0, 0, 0, 0);
     for s in states {
+        total += 1;
         match s {
             CheckOutcome::Passed => passed += 1,
             CheckOutcome::Failed => failed += 1,
@@ -60,7 +62,7 @@ fn tally(states: impl IntoIterator<Item = CheckOutcome>) -> (u32, u32, u32) {
             CheckOutcome::Skipped => {}
         }
     }
-    (passed, failed, pending)
+    (passed, failed, pending, total)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +70,7 @@ enum CheckOutcome {
     Passed,
     Failed,
     Pending,
+    /// Skipped, neutral, or cancelled.
     Skipped,
 }
 
@@ -467,8 +470,8 @@ impl GitHub {
             " } fragment pr on PullRequest { headRefOid mergeable mergeStateStatus \
              commits(last: 1) { nodes { commit { statusCheckRollup { state \
              contexts(first: 100) { nodes { __typename \
-             ... on CheckRun { name status conclusion startedAt \
-             checkSuite { workflowRun { workflow { name } } } } \
+             ... on CheckRun { databaseId name status conclusion startedAt completedAt \
+             checkSuite { workflowRun { databaseId workflow { name } } } } \
              ... on StatusContext { context state createdAt } } } } } } } }",
         );
         let reply: GqlReply = self.http.post_json(
@@ -837,10 +840,12 @@ struct GqlContexts {
 enum GqlContext {
     #[serde(rename_all = "camelCase")]
     CheckRun {
+        database_id: Option<i64>,
         name: String,
         status: String,
         conclusion: Option<String>,
         started_at: Option<String>,
+        completed_at: Option<String>,
         check_suite: Option<GqlCheckSuite>,
     },
     #[serde(rename_all = "camelCase")]
@@ -860,7 +865,9 @@ struct GqlCheckSuite {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GqlWorkflowRun {
+    database_id: Option<i64>,
     workflow: GqlWorkflow,
 }
 
@@ -870,42 +877,53 @@ struct GqlWorkflow {
 }
 
 /// Re-running a workflow leaves the earlier runs on the commit next to the
-/// new ones. Keep only the latest run of each job, as GitHub's own view
-/// does. Jobs are told apart by workflow and name, since two workflows
-/// can both have a job called `build`.
+/// new ones. Keep only the latest run of each job, as Paseo does: the newest
+/// workflow run wins. A re-run keeps its workflow run id, so the newest
+/// check run breaks the tie. Jobs are told apart by workflow and name, since
+/// two workflows can both have a job called `build`.
 fn latest_per_name(nodes: &[GqlContext]) -> Vec<&GqlContext> {
-    let mut latest: std::collections::BTreeMap<String, (&str, &GqlContext)> =
+    let millis = |s: &Option<String>| {
+        s.as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map_or(0, |t| t.timestamp_millis())
+    };
+    let mut latest: std::collections::BTreeMap<String, ((i64, i64), &GqlContext)> =
         std::collections::BTreeMap::new();
     for node in nodes {
-        let (name, when) = match node {
+        let (name, recency) = match node {
             GqlContext::CheckRun {
+                database_id,
                 name,
                 started_at,
+                completed_at,
                 check_suite,
                 ..
             } => {
-                let workflow = check_suite
-                    .as_ref()
-                    .and_then(|c| c.workflow_run.as_ref())
-                    .map(|w| w.workflow.name.as_str())
-                    .unwrap_or("");
+                let run = check_suite.as_ref().and_then(|c| c.workflow_run.as_ref());
+                let workflow = run.map(|w| w.workflow.name.as_str()).unwrap_or("");
+                let first = run.and_then(|w| w.database_id).unwrap_or_else(|| {
+                    millis(if completed_at.is_some() {
+                        completed_at
+                    } else {
+                        started_at
+                    })
+                });
                 (
                     format!("{workflow} / {name}"),
-                    started_at.as_deref().unwrap_or(""),
+                    (first, database_id.unwrap_or(0)),
                 )
             }
             GqlContext::StatusContext {
                 context,
                 created_at,
                 ..
-            } => (context.clone(), created_at.as_deref().unwrap_or("")),
+            } => (context.clone(), (millis(created_at), 0)),
             GqlContext::Other => continue,
         };
-        // ISO 8601 timestamps sort as text; ties go to the later entry.
         match latest.get(&name) {
-            Some((seen, _)) if *seen > when => {}
+            Some((seen, _)) if *seen >= recency => {}
             _ => {
-                latest.insert(name, (when, node));
+                latest.insert(name, (recency, node));
             }
         }
     }
@@ -921,19 +939,19 @@ impl GqlContext {
                 if status != "COMPLETED" {
                     return CheckOutcome::Pending;
                 }
+                // As Paseo maps them. A conclusion not listed here, such as
+                // STALE or STARTUP_FAILURE, stays pending.
                 match conclusion.as_deref() {
-                    Some("SUCCESS" | "NEUTRAL") => CheckOutcome::Passed,
-                    // Cut short by a failing sibling or a newer run: not a
-                    // result of its own.
-                    Some("SKIPPED" | "CANCELLED" | "STALE") => CheckOutcome::Skipped,
-                    None => CheckOutcome::Pending,
-                    Some(_) => CheckOutcome::Failed,
+                    Some("SUCCESS") => CheckOutcome::Passed,
+                    Some("FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED") => CheckOutcome::Failed,
+                    Some("CANCELLED" | "SKIPPED" | "NEUTRAL") => CheckOutcome::Skipped,
+                    _ => CheckOutcome::Pending,
                 }
             }
             GqlContext::StatusContext { state, .. } => match state.as_str() {
                 "SUCCESS" => CheckOutcome::Passed,
-                "PENDING" | "EXPECTED" => CheckOutcome::Pending,
-                _ => CheckOutcome::Failed,
+                "FAILURE" | "ERROR" => CheckOutcome::Failed,
+                _ => CheckOutcome::Pending,
             },
             GqlContext::Other => CheckOutcome::Passed,
         }
@@ -962,8 +980,7 @@ impl GqlPr {
         let (passed, failed, pending, total) = match rollup {
             Some(r) => {
                 let runs = latest_per_name(&r.contexts.nodes);
-                let (p, f, pe) = tally(runs.iter().map(|c| c.outcome()));
-                (p, f, pe, p + f + pe)
+                tally(runs.iter().map(|c| c.outcome()))
             }
             None => (0, 0, 0, 0),
         };
@@ -1163,14 +1180,14 @@ impl Forge for Forgejo {
                 }
             };
             let statuses = combined.statuses.unwrap_or_default();
-            let (passed, failed, pending) =
+            let (passed, failed, pending, total) =
                 tally(statuses.iter().map(|st| match st.status.as_str() {
-                    // Forgejo states: success, warning, pending, skipped,
-                    // failure, error.
-                    "success" | "warning" => CheckOutcome::Passed,
-                    "pending" => CheckOutcome::Pending,
+                    // As Paseo maps them. Forgejo blocks a merge on
+                    // "warning", so it is not a pass.
+                    "success" => CheckOutcome::Passed,
+                    "failure" | "error" | "warning" => CheckOutcome::Failed,
                     "skipped" => CheckOutcome::Skipped,
-                    _ => CheckOutcome::Failed,
+                    _ => CheckOutcome::Pending,
                 }));
             let merge = match pr.mergeable {
                 Some(true) => MergeState::Clean,
@@ -1183,7 +1200,7 @@ impl Forge for Forgejo {
                     passed,
                     failed,
                     pending,
-                    total: passed + failed + pending,
+                    total,
                     merge,
                     head_sha: pr.head.sha,
                     checked_at: Utc::now(),
@@ -1596,20 +1613,73 @@ mod tests {
             .unwrap()
             .into_checks(Utc::now());
         // Two workflows share a job name and stay apart; the cancelled one
-        // counts for nothing.
-        assert_eq!((c.passed, c.failed, c.pending, c.total), (4, 0, 0, 4));
+        // counts only in the total.
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (4, 0, 0, 5));
     }
 
     #[test]
-    fn skipped_jobs_count_for_nothing() {
-        let (p, f, pe) = tally([
+    fn a_queued_rerun_replaces_the_failed_run() {
+        // A re-run keeps its workflow run id and has no start time while
+        // queued. The newer check run id still makes it the latest.
+        let json = r#"{"headRefOid": "abc", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "PENDING",
+            "contexts": {"nodes": [
+                {"__typename": "CheckRun", "databaseId": 11, "name": "build", "status": "COMPLETED", "conclusion": "FAILURE",
+                 "startedAt": "2026-10-22T10:00:00Z", "completedAt": "2026-10-22T10:05:00Z",
+                 "checkSuite": {"workflowRun": {"databaseId": 7, "workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "databaseId": 12, "name": "build", "status": "QUEUED", "conclusion": null,
+                 "startedAt": null, "completedAt": null,
+                 "checkSuite": {"workflowRun": {"databaseId": 7, "workflow": {"name": "CI"}}}}]}}}}]}}"#;
+        let c = serde_json::from_str::<GqlPr>(json)
+            .unwrap()
+            .into_checks(Utc::now());
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn conclusions_map_as_in_paseo() {
+        let run = |conclusion: &str| GqlContext::CheckRun {
+            database_id: None,
+            name: "x".into(),
+            status: "COMPLETED".into(),
+            conclusion: Some(conclusion.into()),
+            started_at: None,
+            completed_at: None,
+            check_suite: None,
+        };
+        use CheckOutcome::*;
+        for (conclusion, outcome) in [
+            ("SUCCESS", Passed),
+            ("FAILURE", Failed),
+            ("TIMED_OUT", Failed),
+            ("ACTION_REQUIRED", Failed),
+            ("CANCELLED", Skipped),
+            ("SKIPPED", Skipped),
+            ("NEUTRAL", Skipped),
+            ("STALE", Pending),
+            ("STARTUP_FAILURE", Pending),
+        ] {
+            assert_eq!(run(conclusion).outcome(), outcome, "{conclusion}");
+        }
+        let status = |state: &str| GqlContext::StatusContext {
+            context: "x".into(),
+            state: state.into(),
+            created_at: None,
+        };
+        assert_eq!(status("ERROR").outcome(), Failed);
+        assert_eq!(status("EXPECTED").outcome(), Pending);
+    }
+
+    #[test]
+    fn skipped_jobs_count_only_in_the_total() {
+        let (p, f, pe, total) = tally([
             CheckOutcome::Passed,
             CheckOutcome::Skipped,
             CheckOutcome::Failed,
             CheckOutcome::Skipped,
             CheckOutcome::Pending,
         ]);
-        assert_eq!((p, f, pe), (1, 1, 1));
+        assert_eq!((p, f, pe, total), (1, 1, 1, 5));
         let json = r#"{"headRefOid": "abc", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS",
             "contexts": {"nodes": [
@@ -1618,7 +1688,7 @@ mod tests {
         let c = serde_json::from_str::<GqlPr>(json)
             .unwrap()
             .into_checks(Utc::now());
-        assert_eq!((c.passed, c.failed, c.pending, c.total), (1, 0, 0, 1));
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (1, 0, 0, 2));
     }
 
     #[test]
