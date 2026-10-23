@@ -1111,6 +1111,8 @@ struct FjUser {
 #[derive(Deserialize)]
 struct FjPull {
     mergeable: Option<bool>,
+    #[serde(default)]
+    draft: bool,
     head: FjHead,
 }
 
@@ -1189,10 +1191,13 @@ impl Forge for Forgejo {
                     "skipped" => CheckOutcome::Skipped,
                     _ => CheckOutcome::Pending,
                 }));
-            let merge = match pr.mergeable {
-                Some(true) => MergeState::Clean,
-                Some(false) => MergeState::Conflicting,
-                None => MergeState::Unknown,
+            let merge = match (pr.mergeable, pr.draft) {
+                (Some(true), _) => MergeState::Clean,
+                // Forgejo calls drafts unmergeable without saying whether
+                // they conflict; GitHub treats drafts as clean, so match it.
+                (Some(false), true) => MergeState::Clean,
+                (Some(false), false) => MergeState::Conflicting,
+                (None, _) => MergeState::Unknown,
             };
             out.push((
                 r.key(),

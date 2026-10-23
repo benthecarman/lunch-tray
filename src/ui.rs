@@ -1611,16 +1611,11 @@ fn check_badges(p: &Palette, t: &Task) -> Vec<Badge> {
             tip,
         });
     }
-    let conflict = match c.merge {
-        MergeState::Conflicting => Some("Conflicts with the base branch: needs a rebase"),
-        MergeState::Behind => Some("Behind the base branch"),
-        _ => None,
-    };
-    if let Some(tip) = conflict {
+    if c.merge == MergeState::Conflicting {
         out.push(Badge {
             text: icons::WARNING.to_string(),
             color: p.warning,
-            tip: tip.to_string(),
+            tip: "Conflicts with the base branch: needs a rebase".to_string(),
         });
     }
     out
