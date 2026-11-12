@@ -17,10 +17,11 @@ tray icon.
 - GitHub and Forgejo (or Gitea) sync. New open items become tasks. Closed or
   merged items settle on their own. New activity on a settled item wakes it.
 - CI results and merge state on open pull requests: passed over total
-  checks, and a warning when the branch conflicts with its base. Only
-  active tasks are polled, and only when the result is missing, stale,
-  still running, or the pull request moved. Settled and archived tasks
-  keep their last badge until they come back.
+  checks, and a warning when the branch conflicts with its base. Active
+  tasks are polled when the result is missing, stale, still running, or
+  the pull request moved. Settled tasks refresh once at startup, then keep
+  their last badge until they come back. Archived tasks keep their last
+  badge until they come back.
 - Light on GitHub's rate limit: searches send the last ETag, so an
   unchanged answer costs nothing; the quota headers are read on every
   answer and optional work waits when the last tenth is left; a

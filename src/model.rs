@@ -435,15 +435,23 @@ impl Store {
     /// Open pull requests on active tasks for `provider`/`host` whose check
     /// state should be fetched now: none saved, the item moved since the
     /// last fetch, the last result was still pending, or it is older than
-    /// `CHECKS_MAX_AGE`. Settled and archived tasks are left alone until
-    /// they come back; their badges may be stale meanwhile. Most recently
-    /// updated first.
+    /// `CHECKS_MAX_AGE`. Settled tasks also refresh after startup marks their
+    /// saved results stale; afterwards they are left alone until they come
+    /// back. Archived tasks are left alone. Most recently updated first.
     pub fn checks_due(&self, provider: Provider, host: &str, now: DateTime<Utc>) -> Vec<RemoteRef> {
         let mut due: Vec<RemoteRef> = self
             .data
             .tasks
             .iter()
-            .filter(|t| t.state == TaskState::Active)
+            .filter(|t| {
+                t.state == TaskState::Active
+                    || t.state == TaskState::Settled
+                        && t.remote().is_some_and(|r| {
+                            r.checks
+                                .as_ref()
+                                .is_some_and(|c| c.checked_at == DateTime::<Utc>::MIN_UTC)
+                        })
+            })
             .filter_map(|t| t.remote())
             .filter(|r| {
                 r.provider == provider
@@ -1460,12 +1468,13 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_makes_every_check_result_due() {
+    fn a_restart_makes_a_settled_check_result_due() {
         let mut s = Store::in_memory();
         let now = Utc::now();
         s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
         let id = s.tasks()[0].id.clone();
         s.set_checks(&id, checks(0, MergeState::Clean, now));
+        s.settle(&id).unwrap();
         assert!(s.checks_due(Provider::GitHub, "github.com", now).is_empty());
         s.mark_checks_stale();
         assert_eq!(s.checks_due(Provider::GitHub, "github.com", now).len(), 1);
