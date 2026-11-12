@@ -2,6 +2,7 @@
 //! and its state machine, the operations that change it, the GitHub and
 //! Forgejo sync, and the MCP protocol handler.
 
+pub mod api;
 pub mod http;
 pub mod mcp;
 pub mod model;

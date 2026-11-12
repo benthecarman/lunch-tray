@@ -8,6 +8,7 @@ use lunch_tray_core::ops::{Applied, Op};
 pub use lunch_tray_core::sync::SyncStatus;
 
 use crate::model::Store;
+use crate::remote::RemoteCmd;
 use crate::sync::SyncCmd;
 use crate::theme::SystemTheme;
 use crate::tray::TrayLink;
@@ -91,6 +92,8 @@ pub struct Shared {
     pub tray: TrayLink,
     pub main_tx: Sender<MainCmd>,
     pub sync_tx: Sender<SyncCmd>,
+    /// Set when a Worker holds the tasks: changes go there too.
+    pub remote: Option<Sender<RemoteCmd>>,
 }
 
 impl Shared {
@@ -118,14 +121,25 @@ impl Shared {
     }
 
     pub fn request_sync(&self) {
-        let _ = self.sync_tx.send(SyncCmd::Now);
+        match &self.remote {
+            Some(tx) => {
+                let _ = tx.send(RemoteCmd::SyncNow);
+            }
+            None => {
+                let _ = self.sync_tx.send(SyncCmd::Now);
+            }
+        }
     }
 
-    /// Apply a change to the store and save it.
+    /// Apply a change: to the store here at once, saved to disk, and sent
+    /// on to the Worker when there is one.
     pub fn apply(&mut self, op: Op) -> Result<Applied, String> {
         let applied = op.apply(&mut self.store)?;
         if applied.changed {
             self.save_store();
+            if let Some(tx) = &self.remote {
+                let _ = tx.send(RemoteCmd::Op(op));
+            }
             self.notify();
         }
         Ok(applied)

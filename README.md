@@ -193,6 +193,14 @@ claude mcp add --transport http lunch-tray https://<machine>.<tailnet>.ts.net/mc
   --header "Authorization: Bearer a-long-random-string"
 ```
 
+## Run it on Cloudflare
+
+The app can also leave the tasks to a Cloudflare Worker. The Worker syncs
+with GitHub on a timer and serves the MCP tools at a public URL behind a
+token, so both stay online while your computer is off. The app then shows
+the Worker's tasks and sends your changes to it. It fits in the Workers
+Free plan. Forgejo stays with the app. See [worker/README.md](worker/README.md).
+
 ## The state machine
 
 A task has one `state` field: `active`, `settled`, or `archived`. Deleted
@@ -261,7 +269,8 @@ cargo clippy --workspace --all-targets
 LUNCH_TRAY_SCREENSHOT=/tmp/shot.png cargo run   # saves the window and quits
 ```
 
-The task model, the sync, and the MCP handler live in `crates/core`.
+The task model, the sync, and the MCP handler live in `crates/core`, shared
+by the app and the Worker in `worker/`, which builds on its own for wasm.
 
 ## License
 

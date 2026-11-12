@@ -1,0 +1,26 @@
+[package]
+name = "lunch-tray-worker"
+version = "0.1.0"
+edition = "2024"
+description = "Lunch Tray on Cloudflare Workers: the task list, its GitHub sync, and the MCP server"
+license = "MIT"
+rust-version = "1.95"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lunch-tray-core = { path = "../crates/core" }
+anyhow = "1.0.104"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+log = "0.4.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+worker = "0.9"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

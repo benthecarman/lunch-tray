@@ -1,0 +1,36 @@
+name = "lunch-tray"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-06-10"
+
+[build]
+command = "cargo install -q worker-build@0.9.0 && worker-build --release"
+
+[[durable_objects.bindings]]
+name = "TRAY"
+class_name = "Tray"
+
+# The Free plan only has SQLite-backed Durable Objects.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Tray"]
+
+[observability]
+enabled = true
+
+# Secrets, set with `npx wrangler secret put NAME`:
+#   API_TOKEN     bearer token for /mcp and /api; the app sends it from [remote]
+#   GITHUB_TOKEN  a GitHub token that can read your pull requests and issues
+[vars]
+POLL_INTERVAL_SECS = "120"
+# "settle" keeps closed and merged items in Settled; "archive" puts them
+# straight in the archive.
+ON_CLOSE = "archive"
+CHECKS = "true"
+# Tracked items the searches no longer return are fetched one by one, this
+# many per pass, so a pass stays under the Free plan's 50 subrequests.
+MAX_INDIVIDUAL_CHECKS = "20"
+# One search per line; empty for the defaults (yours, review requests,
+# assigned).
+GITHUB_QUERIES = ""
+# owner/repo or owner/*, comma or line separated.
+GITHUB_EXCLUDE = ""

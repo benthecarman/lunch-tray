@@ -345,6 +345,14 @@ pub enum SyncEvent {
     },
 }
 
+/// The part of the store a remote copy shares: the tasks and the counter
+/// for manual task ids. Settings stay on each device.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub tasks: Vec<Task>,
+    pub next_manual_id: u64,
+}
+
 pub struct Store {
     data: StoreData,
     path: Option<PathBuf>,
@@ -384,6 +392,41 @@ impl Store {
         std::fs::write(&tmp, serde_json::to_string_pretty(&self.data)?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// The same store, saved to `path` from now on.
+    pub fn with_path(mut self, path: PathBuf) -> Self {
+        self.path = Some(path);
+        self
+    }
+
+    /// A store with no file, from shared parts.
+    pub fn from_snapshot(snap: Snapshot) -> Self {
+        Store {
+            data: StoreData {
+                tasks: snap.tasks,
+                next_manual_id: snap.next_manual_id,
+                settings: Settings::default(),
+            },
+            path: None,
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            tasks: self.data.tasks.clone(),
+            next_manual_id: self.data.next_manual_id,
+        }
+    }
+
+    /// Take the tasks of another copy, keeping this device's settings.
+    pub fn replace_with(&mut self, snap: Snapshot) {
+        self.data.tasks = snap.tasks;
+        self.data.next_manual_id = snap.next_manual_id;
+    }
+
+    pub fn next_manual_id(&self) -> u64 {
+        self.data.next_manual_id
     }
 
     pub fn settings(&self) -> &Settings {

@@ -30,6 +30,11 @@ pub fn store_path() -> PathBuf {
     data_dir().join("tasks.json")
 }
 
+/// The copy of a Worker's tasks, for a start without network.
+pub fn remote_cache_path() -> PathBuf {
+    data_dir().join("remote-cache.json")
+}
+
 const TEMPLATE: &str = r#"# Lunch Tray configuration.
 #
 # Seconds between remote syncs.
@@ -69,6 +74,16 @@ poll_interval_secs = 120
 # ]
 # exclude = ["someorg/noisy-repo"]
 
+# A Lunch Tray Worker that keeps the tasks and does the sync. With this
+# section, the app shows and changes the Worker's tasks; the [[github]],
+# [[forgejo]], and [mcp] sections are then not used, since the Worker has
+# its own. See worker/README.md.
+# [remote]
+# url = "https://lunch-tray.example.workers.dev"
+# token = "..."                 # the Worker's API_TOKEN
+# token_env = "LUNCH_TRAY_REMOTE_TOKEN"
+# poll_secs = 10
+
 # MCP server: the task list as tools for AI assistants, over HTTP at
 # http://<listen>/mcp. Off unless this section is present.
 # [mcp]
@@ -97,6 +112,9 @@ pub struct Config {
     /// The MCP server, when the section is present.
     #[serde(default)]
     pub mcp: Option<McpConfig>,
+    /// A Worker that holds the tasks, when the section is present.
+    #[serde(default)]
+    pub remote: Option<RemoteConfig>,
 }
 
 impl Default for Config {
@@ -108,6 +126,7 @@ impl Default for Config {
             github: vec![GithubAccount::default()],
             forgejo: Vec::new(),
             mcp: None,
+            remote: None,
         }
     }
 }
@@ -264,6 +283,31 @@ fn default_mcp_listen() -> String {
     "127.0.0.1:7428".to_string()
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteConfig {
+    /// The Worker's base URL.
+    pub url: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// Seconds between checks for changes.
+    #[serde(default = "default_remote_poll")]
+    pub poll_secs: u64,
+}
+
+impl RemoteConfig {
+    pub fn resolve_token(&self) -> Result<String> {
+        configured_token(&self.token, &self.token_env, "LUNCH_TRAY_REMOTE_TOKEN")
+            .context("no token for the Worker: set `token` or `token_env` under [remote]")
+    }
+}
+
+fn default_remote_poll() -> u64 {
+    10
+}
+
 impl Config {
     /// Load the config file. When it does not exist, write a commented
     /// template and use the defaults (one GitHub account through `gh`).
@@ -301,6 +345,8 @@ mod tests {
         assert!(cfg.mcp.is_none());
         let cfg: Config = toml::from_str("[mcp]").unwrap();
         assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:7428");
+        let cfg: Config = toml::from_str("[remote]\nurl = \"https://w.example\"").unwrap();
+        assert_eq!(cfg.remote.unwrap().poll_secs, 10);
         let cfg: Config = toml::from_str("on_close = \"archive\"").unwrap();
         assert_eq!(cfg.on_close, OnClose::Archive);
     }
