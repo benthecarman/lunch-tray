@@ -15,6 +15,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
+base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "7.0.0"
 # glow instead of the default wgpu renderer: a fraction of the memory for a
@@ -38,6 +39,8 @@ ring = "0.17"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 signal-hook = "0.4"
+# Small and blocking, like the rest of the app; serves the MCP endpoint.
+tiny_http = "0.12"
 toml = "1.1.6"
 ureq = { version = "3", features = ["json"] }
 zbus = "5"

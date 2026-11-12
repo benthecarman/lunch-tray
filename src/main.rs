@@ -4,6 +4,7 @@
 mod activate;
 mod brand;
 mod config;
+mod mcp;
 mod model;
 mod shared;
 mod style;
@@ -159,6 +160,16 @@ fn main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("sync".into())
             .spawn(move || sync::run_loop(forges, shared, sync_rx, interval, on_close, checks))?;
+    }
+
+    if let Some(mcp_cfg) = &cfg.mcp
+        && let Err(e) = mcp::start(mcp_cfg, shared.clone())
+    {
+        log::warn!("mcp server not started: {e:#}");
+        shared
+            .lock()
+            .unwrap()
+            .push_notice(Notice::error(format!("MCP server not started: {e:#}")));
     }
 
     systemd::notify("READY=1\n");

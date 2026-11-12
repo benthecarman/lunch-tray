@@ -67,6 +67,15 @@ poll_interval_secs = 120
 #   "type=issues&assigned=true",
 # ]
 # exclude = ["someorg/noisy-repo"]
+
+# MCP server: the task list as tools for AI assistants, over HTTP at
+# http://<listen>/mcp. Off unless this section is present.
+# [mcp]
+# listen = "127.0.0.1:7428"
+# token = "..."                 # clients send "Authorization: Bearer <token>"
+# token_env = "LUNCH_TRAY_MCP_TOKEN"
+# Browser origins allowed to call it. Clients that are not browsers send none.
+# allowed_origins = []
 "#;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -84,6 +93,9 @@ pub struct Config {
     pub github: Vec<GithubAccount>,
     #[serde(default)]
     pub forgejo: Vec<ForgejoAccount>,
+    /// The MCP server, when the section is present.
+    #[serde(default)]
+    pub mcp: Option<McpConfig>,
 }
 
 impl Default for Config {
@@ -94,6 +106,7 @@ impl Default for Config {
             checks: true,
             github: vec![GithubAccount::default()],
             forgejo: Vec::new(),
+            mcp: None,
         }
     }
 }
@@ -244,6 +257,33 @@ fn default_forgejo_queries() -> Vec<String> {
     ]
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    /// Address and port to listen on.
+    #[serde(default = "default_mcp_listen")]
+    pub listen: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// Values of the `Origin` header to accept. Requests with any other
+    /// origin are refused; requests without one are fine.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+impl McpConfig {
+    /// The bearer token clients must send, if one is set.
+    pub fn resolve_token(&self) -> Option<String> {
+        configured_token(&self.token, &self.token_env, "LUNCH_TRAY_MCP_TOKEN")
+    }
+}
+
+fn default_mcp_listen() -> String {
+    "127.0.0.1:7428".to_string()
+}
+
 /// True when `owner/repo` matches one of the exclude patterns. Patterns are
 /// `owner/repo` or `owner/*`, compared without regard to case.
 pub fn is_excluded(patterns: &[String], owner: &str, repo: &str) -> bool {
@@ -289,6 +329,9 @@ mod tests {
         assert_eq!(cfg.github[0].host(), "github.com");
         assert_eq!(cfg.github[0].queries, default_github_queries());
         assert!(cfg.forgejo.is_empty());
+        assert!(cfg.mcp.is_none());
+        let cfg: Config = toml::from_str("[mcp]").unwrap();
+        assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:7428");
         let cfg: Config = toml::from_str("on_close = \"archive\"").unwrap();
         assert_eq!(cfg.on_close, OnClose::Archive);
     }

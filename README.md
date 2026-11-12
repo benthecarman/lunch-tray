@@ -152,6 +152,46 @@ would and keeps the cookie for the session.
 
 Tasks are stored in `~/.local/share/lunch-tray/tasks.json`.
 
+## MCP server
+
+Lunch Tray can give AI assistants its task list as MCP tools: list, get,
+add, update, move, and delete tasks, mark them as read, sync now, and show
+the status. It is off by default. To turn it on, add an `[mcp]` section to
+`config.toml` and restart the app:
+
+```toml
+[mcp]
+listen = "127.0.0.1:7428"   # the default
+token = "a-long-random-string"   # or token_env; clients send it as a Bearer token
+# allowed_origins = []      # browser origins to accept; others get 403
+```
+
+The endpoint is `http://<listen>/mcp`. It uses the Streamable HTTP
+transport of MCP revision 2026-07-28: stateless, with `server/discover`
+and no `initialize` handshake. Clients on the 2025 revisions also work.
+Their `initialize` gets an answer, and the server never issues a session
+id. Each response is a single JSON object; nothing streams.
+
+To reach it from other devices on your tailnet, keep it on localhost and
+let Tailscale serve it over HTTPS:
+
+```sh
+tailscale serve --bg 7428
+```
+
+The URL is then `https://<machine>.<tailnet>.ts.net/mcp`. As an
+alternative, set `listen` to the machine's tailnet address (see
+`tailscale ip -4`). If that address is not up yet when the app starts,
+the server tries again every ten seconds.
+
+Set a token. Without one, anyone who can reach the port can read and
+change your tasks. To add the server to Claude Code:
+
+```sh
+claude mcp add --transport http lunch-tray https://<machine>.<tailnet>.ts.net/mcp \
+  --header "Authorization: Bearer a-long-random-string"
+```
+
 ## The state machine
 
 A task has one `state` field: `active`, `settled`, or `archived`. Deleted
