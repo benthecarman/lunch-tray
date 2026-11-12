@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use lunch_tray_core::sync::{default_github_queries, forgejo_host, github_host};
 use serde::Deserialize;
 
 use crate::model::OnClose;
@@ -150,16 +151,7 @@ impl Default for GithubAccount {
 impl GithubAccount {
     /// Host name used in task ids and labels.
     pub fn host(&self) -> String {
-        let trimmed = self
-            .api_url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        let host = trimmed.split('/').next().unwrap_or(trimmed);
-        if host == "api.github.com" {
-            "github.com".to_string()
-        } else {
-            host.to_string()
-        }
+        github_host(&self.api_url)
     }
 
     pub fn resolve_token(&self) -> Result<String> {
@@ -206,14 +198,6 @@ fn default_github_api() -> String {
     "https://api.github.com".to_string()
 }
 
-fn default_github_queries() -> Vec<String> {
-    vec![
-        "is:open is:pr author:@me archived:false".into(),
-        "is:open is:pr review-requested:@me archived:false".into(),
-        "is:open assignee:@me archived:false".into(),
-    ]
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForgejoAccount {
@@ -231,11 +215,7 @@ pub struct ForgejoAccount {
 
 impl ForgejoAccount {
     pub fn host(&self) -> String {
-        let trimmed = self
-            .url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        trimmed.split('/').next().unwrap_or(trimmed).to_string()
+        forgejo_host(&self.url)
     }
 
     pub fn resolve_token(&self) -> Result<String> {
@@ -284,17 +264,6 @@ fn default_mcp_listen() -> String {
     "127.0.0.1:7428".to_string()
 }
 
-/// True when `owner/repo` matches one of the exclude patterns. Patterns are
-/// `owner/repo` or `owner/*`, compared without regard to case.
-pub fn is_excluded(patterns: &[String], owner: &str, repo: &str) -> bool {
-    patterns.iter().any(|pat| {
-        let Some((p_owner, p_repo)) = pat.trim().split_once('/') else {
-            return false;
-        };
-        p_owner.eq_ignore_ascii_case(owner) && (p_repo == "*" || p_repo.eq_ignore_ascii_case(repo))
-    })
-}
-
 impl Config {
     /// Load the config file. When it does not exist, write a commented
     /// template and use the defaults (one GitHub account through `gh`).
@@ -334,20 +303,6 @@ mod tests {
         assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:7428");
         let cfg: Config = toml::from_str("on_close = \"archive\"").unwrap();
         assert_eq!(cfg.on_close, OnClose::Archive);
-    }
-
-    #[test]
-    fn exclude_patterns_match_repos_and_owners() {
-        let pats = vec![
-            "Acme/Widgets".to_string(),
-            "noisy/*".to_string(),
-            "bad".to_string(),
-        ];
-        assert!(is_excluded(&pats, "acme", "widgets"));
-        assert!(!is_excluded(&pats, "acme", "gadgets"));
-        assert!(is_excluded(&pats, "noisy", "anything"));
-        assert!(!is_excluded(&pats, "quiet", "anything"));
-        assert!(!is_excluded(&[], "acme", "widgets"));
     }
 
     #[test]

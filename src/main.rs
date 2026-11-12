@@ -5,7 +5,6 @@ mod activate;
 mod brand;
 mod config;
 mod mcp;
-mod model;
 mod shared;
 mod style;
 mod sync;
@@ -19,6 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+
+pub use lunch_tray_core::model;
 
 use crate::config::{Config, store_path};
 use crate::model::Store;
@@ -151,15 +152,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Remote sync.
-    let forges = sync::build_forges(&cfg, &shared);
-    let interval = Duration::from_secs(cfg.poll_interval_secs.max(15));
-    let on_close = cfg.on_close;
-    let checks = cfg.checks;
     {
         let shared = shared.clone();
+        let sync_cfg = cfg.clone();
         std::thread::Builder::new()
             .name("sync".into())
-            .spawn(move || sync::run_loop(forges, shared, sync_rx, interval, on_close, checks))?;
+            .spawn(move || sync::run_loop(sync_cfg, shared, sync_rx))?;
     }
 
     if let Some(mcp_cfg) = &cfg.mcp
@@ -205,7 +203,7 @@ fn main() -> anyhow::Result<()> {
                     Duration::ZERO
                 };
                 match main_rx.recv_timeout(wait) {
-                    Ok(MainCmd::Quit) => return shutdown(&sync_tx),
+                    Ok(MainCmd::Quit) => return shutdown(&shared),
                     Ok(MainCmd::OpenWindow(WindowMode::Popover))
                         if mode == WindowMode::Popover && next.is_none() => {}
                     Ok(MainCmd::OpenWindow(m)) => next = Some((m, false)),
@@ -220,14 +218,17 @@ fn main() -> anyhow::Result<()> {
         match main_rx.recv() {
             Ok(MainCmd::OpenWindow(mode)) => next = Some((mode, false)),
             Ok(MainCmd::OpenAddDialog) => next = Some((WindowMode::Full, true)),
-            Ok(MainCmd::Quit) | Err(_) => return shutdown(&sync_tx),
+            Ok(MainCmd::Quit) | Err(_) => return shutdown(&shared),
         }
     }
 }
 
-fn shutdown(sync_tx: &std::sync::mpsc::Sender<SyncCmd>) -> anyhow::Result<()> {
+fn shutdown(shared: &shared::SharedRef) -> anyhow::Result<()> {
     systemd::notify("STOPPING=1\n");
-    let _ = sync_tx.send(SyncCmd::Quit);
+    {
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = s.sync_tx.send(SyncCmd::Quit);
+    }
     log::info!("bye");
     Ok(())
 }

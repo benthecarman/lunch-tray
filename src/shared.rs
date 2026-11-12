@@ -4,7 +4,8 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use chrono::{DateTime, Utc};
+use lunch_tray_core::ops::{Applied, Op};
+pub use lunch_tray_core::sync::SyncStatus;
 
 use crate::model::Store;
 use crate::sync::SyncCmd;
@@ -42,13 +43,6 @@ impl Notice {
             at: Instant::now(),
         }
     }
-}
-
-#[derive(Default)]
-pub struct SyncStatus {
-    pub in_progress: bool,
-    pub last_finished: Option<DateTime<Utc>>,
-    pub errors: Vec<String>,
 }
 
 /// The two shapes the window can take.
@@ -125,6 +119,28 @@ impl Shared {
 
     pub fn request_sync(&self) {
         let _ = self.sync_tx.send(SyncCmd::Now);
+    }
+
+    /// Apply a change to the store and save it.
+    pub fn apply(&mut self, op: Op) -> Result<Applied, String> {
+        let applied = op.apply(&mut self.store)?;
+        if applied.changed {
+            self.save_store();
+            self.notify();
+        }
+        Ok(applied)
+    }
+
+    /// `apply`, with a refusal shown as a notice. Returns true when
+    /// something changed.
+    pub fn run(&mut self, op: Op) -> bool {
+        match self.apply(op) {
+            Ok(a) => a.changed,
+            Err(e) => {
+                self.push_notice(Notice::error(e));
+                false
+            }
+        }
     }
 
     /// Bring a window of `mode` up: focus it if it is already open, switch

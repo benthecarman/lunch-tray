@@ -256,10 +256,12 @@ or number. Each word must match somewhere, so `ldk 291` finds ldk-server
 ## Development
 
 ```sh
-cargo test
-cargo clippy --all-targets
+cargo test --workspace
+cargo clippy --workspace --all-targets
 LUNCH_TRAY_SCREENSHOT=/tmp/shot.png cargo run   # saves the window and quits
 ```
+
+The task model, the sync, and the MCP handler live in `crates/core`.
 
 ## License
 

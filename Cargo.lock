@@ -2038,6 +2038,7 @@ name = "lunch-tray"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "chrono",
  "dirs",
@@ -2048,9 +2049,10 @@ dependencies = [
  "image",
  "ksni",
  "log",
+ "lunch-tray-core",
  "open",
+ "pollster",
  "raw-window-handle",
- "ring",
  "serde",
  "serde_json",
  "signal-hook",
@@ -2062,6 +2064,21 @@ dependencies = [
  "wayland-protocols",
  "winit",
  "zbus",
+]
+
+[[package]]
+name = "lunch-tray-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "log",
+ "pollster",
+ "serde",
+ "serde_json",
+ "sha1_smol",
 ]
 
 [[package]]
@@ -2744,6 +2761,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pollster"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
+
+[[package]]
 name = "polycool"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3147,6 +3170,12 @@ checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "shlex"

@@ -14,6 +14,8 @@ use egui::{
     ViewportBuilder, ViewportCommand, pos2, vec2,
 };
 
+use lunch_tray_core::ops::Op;
+
 use crate::config::APP_ID;
 use crate::model::{
     MergeState, Origin, RemoteKind, RemoteState, Rung, Sections, Task, TaskState, ThemePref,
@@ -222,10 +224,7 @@ impl App {
             Action::OpenLink(id) => {
                 let (url, manual) = {
                     let mut s = self.shared.lock().unwrap();
-                    if s.store.mark_seen(&id) {
-                        s.save_store();
-                        s.notify();
-                    }
+                    s.run(Op::MarkSeen { id: id.clone() });
                     let t = s.store.get(&id);
                     (
                         t.and_then(|t| t.url().map(str::to_string)),
@@ -247,19 +246,13 @@ impl App {
                 }
             }
             Action::Settle(id) => {
-                let mut s = self.shared.lock().unwrap();
-                let r = s.store.settle(&id);
-                finish(&mut s, r);
+                self.shared.lock().unwrap().run(Op::Settle { id });
             }
             Action::Reopen(id) => {
-                let mut s = self.shared.lock().unwrap();
-                let r = s.store.reopen(&id);
-                finish(&mut s, r);
+                self.shared.lock().unwrap().run(Op::Reopen { id });
             }
             Action::Archive(id) => {
-                let mut s = self.shared.lock().unwrap();
-                let r = s.store.archive(&id);
-                finish(&mut s, r);
+                self.shared.lock().unwrap().run(Op::Archive { id });
             }
             Action::Delete(id) => {
                 let title = self
@@ -290,52 +283,54 @@ impl App {
                 }
             }
             Action::Pin(id, pinned) => {
-                let mut s = self.shared.lock().unwrap();
-                let r = s.store.set_pinned(&id, pinned);
-                finish(&mut s, r);
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .run(Op::SetPinned { id, pinned });
             }
         }
     }
 
     fn confirm_delete(&mut self, id: &str) {
-        let mut s = self.shared.lock().unwrap();
-        let r = s.store.delete(id);
-        finish(&mut s, r);
+        self.shared
+            .lock()
+            .unwrap()
+            .run(Op::Delete { id: id.to_string() });
     }
 
     fn save_task(&mut self, id: Option<String>, title: &str, notes: &str, link: &str) -> bool {
         let mut s = self.shared.lock().unwrap();
         match id {
             None => {
-                if title.trim().is_empty() {
-                    s.push_notice(Notice::error("A task needs a title."));
-                    return false;
-                }
-                s.store.add_manual(title, notes, Some(link.to_string()));
-                s.save_store();
-                s.notify();
-                true
-            }
-            Some(id) => {
-                let renamed = match s.store.rename(&id, title) {
-                    Ok(changed) => changed,
+                let op = Op::Add {
+                    title: title.to_string(),
+                    notes: notes.to_string(),
+                    link: Some(link.to_string()),
+                };
+                match s.apply(op) {
+                    Ok(_) => true,
                     Err(e) => {
                         s.push_notice(Notice::error(e));
-                        return false;
+                        false
                     }
+                }
+            }
+            Some(id) => {
+                let rename = Op::Rename {
+                    id: id.clone(),
+                    title: title.to_string(),
                 };
-                let manual = s
-                    .store
-                    .get(&id)
-                    .map(|t| t.origin == Origin::Manual)
-                    .unwrap_or(false);
-                let edited = manual
-                    && s.store
-                        .edit_manual(&id, notes, Some(link.to_string()))
-                        .unwrap_or(false);
-                if renamed || edited {
-                    s.save_store();
-                    s.notify();
+                if let Err(e) = s.apply(rename) {
+                    s.push_notice(Notice::error(e));
+                    return false;
+                }
+                let manual = s.store.get(&id).is_some_and(|t| t.origin == Origin::Manual);
+                if manual {
+                    s.run(Op::EditManual {
+                        id,
+                        notes: notes.to_string(),
+                        link: Some(link.to_string()),
+                    });
                 }
                 true
             }
@@ -419,22 +414,6 @@ impl Heartbeat {
             })
             .expect("spawn heartbeat");
         hb
-    }
-}
-
-/// Apply the result of a transition: persist on change, show errors.
-fn finish(s: &mut crate::shared::Shared, r: Result<bool, String>) -> bool {
-    match r {
-        Ok(true) => {
-            s.save_store();
-            s.notify();
-            true
-        }
-        Ok(false) => false,
-        Err(e) => {
-            s.push_notice(Notice::error(e));
-            false
-        }
     }
 }
 
@@ -819,12 +798,7 @@ impl App {
                 .button(format!("{}  Mark all as read", icons::CHECKS))
                 .clicked()
             {
-                let mut s = self.shared.lock().unwrap();
-                let n = s.store.mark_all_seen();
-                if n > 0 {
-                    s.save_store();
-                    s.notify();
-                }
+                self.shared.lock().unwrap().run(Op::MarkAllSeen);
                 ui.close();
             }
             if ui
@@ -1194,8 +1168,10 @@ impl App {
                 }
                 if confirmed {
                     let mut s = self.shared.lock().unwrap();
-                    let archived = s.store.archive_many(&ids);
-                    s.save_store();
+                    let archived = s
+                        .apply(Op::ArchiveMany { ids: ids.clone() })
+                        .map(|a| a.count)
+                        .unwrap_or(0);
                     s.push_notice(Notice::info(if archived == 1 {
                         "Archived 1 task".to_string()
                     } else {

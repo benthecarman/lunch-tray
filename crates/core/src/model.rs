@@ -351,7 +351,7 @@ pub struct Store {
 }
 
 impl Store {
-    #[cfg(test)]
+    /// A store that is never written to disk.
     pub fn in_memory() -> Self {
         Store {
             data: StoreData::default(),
