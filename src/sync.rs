@@ -49,12 +49,10 @@ pub trait Forge: Send {
 }
 
 /// Count CI contexts as passed, failed, and pending, plus the total.
-/// Skipped and cancelled jobs are finished without passing or failing: they
-/// count only in the total, as in Paseo.
+/// Skipped, neutral, and cancelled jobs are left out of the total.
 fn tally(states: impl IntoIterator<Item = CheckOutcome>) -> (u32, u32, u32, u32) {
-    let (mut passed, mut failed, mut pending, mut total) = (0, 0, 0, 0);
+    let (mut passed, mut failed, mut pending) = (0, 0, 0);
     for s in states {
-        total += 1;
         match s {
             CheckOutcome::Passed => passed += 1,
             CheckOutcome::Failed => failed += 1,
@@ -62,7 +60,7 @@ fn tally(states: impl IntoIterator<Item = CheckOutcome>) -> (u32, u32, u32, u32)
             CheckOutcome::Skipped => {}
         }
     }
-    (passed, failed, pending, total)
+    (passed, failed, pending, passed + failed + pending)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -876,12 +874,28 @@ struct GqlWorkflow {
     name: String,
 }
 
-/// Re-running a workflow leaves the earlier runs on the commit next to the
-/// new ones. Keep only the latest run of each job, as Paseo does: the newest
-/// workflow run wins. A re-run keeps its workflow run id, so the newest
-/// check run breaks the tie. Jobs are told apart by workflow and name, since
-/// two workflows can both have a job called `build`.
+/// A workflow contributes only its newest run, so jobs removed from a newer
+/// run do not linger from an older one. A re-run keeps its workflow run id,
+/// so the newest check run breaks the tie for each job. Jobs are told apart
+/// by workflow and name, since two workflows can both have a job called
+/// `build`.
 fn latest_per_name(nodes: &[GqlContext]) -> Vec<&GqlContext> {
+    let mut newest_runs: HashMap<&str, i64> = HashMap::new();
+    for node in nodes {
+        let GqlContext::CheckRun { check_suite, .. } = node else {
+            continue;
+        };
+        let Some(run) = check_suite.as_ref().and_then(|c| c.workflow_run.as_ref()) else {
+            continue;
+        };
+        if let Some(id) = run.database_id {
+            newest_runs
+                .entry(run.workflow.name.as_str())
+                .and_modify(|newest| *newest = (*newest).max(id))
+                .or_insert(id);
+        }
+    }
+
     let millis = |s: &Option<String>| {
         s.as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
@@ -901,6 +915,12 @@ fn latest_per_name(nodes: &[GqlContext]) -> Vec<&GqlContext> {
             } => {
                 let run = check_suite.as_ref().and_then(|c| c.workflow_run.as_ref());
                 let workflow = run.map(|w| w.workflow.name.as_str()).unwrap_or("");
+                if run.is_some_and(|run| {
+                    run.database_id
+                        .is_some_and(|id| newest_runs.get(workflow) != Some(&id))
+                }) {
+                    continue;
+                }
                 let first = run.and_then(|w| w.database_id).unwrap_or_else(|| {
                     millis(if completed_at.is_some() {
                         completed_at
@@ -1618,8 +1638,25 @@ mod tests {
             .unwrap()
             .into_checks(Utc::now());
         // Two workflows share a job name and stay apart; the cancelled one
-        // counts only in the total.
-        assert_eq!((c.passed, c.failed, c.pending, c.total), (4, 0, 0, 5));
+        // is left out of the total.
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (4, 0, 0, 4));
+    }
+
+    #[test]
+    fn jobs_absent_from_the_latest_workflow_run_do_not_count() {
+        let json = r#"{"headRefOid": "abc", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+            "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS",
+            "contexts": {"nodes": [
+                {"__typename": "CheckRun", "databaseId": 11, "name": "build", "status": "COMPLETED", "conclusion": "FAILURE",
+                 "checkSuite": {"workflowRun": {"databaseId": 7, "workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "databaseId": 12, "name": "release", "status": "COMPLETED", "conclusion": "SUCCESS",
+                 "checkSuite": {"workflowRun": {"databaseId": 7, "workflow": {"name": "CI"}}}},
+                {"__typename": "CheckRun", "databaseId": 13, "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS",
+                 "checkSuite": {"workflowRun": {"databaseId": 8, "workflow": {"name": "CI"}}}}]}}}}]}}"#;
+        let c = serde_json::from_str::<GqlPr>(json)
+            .unwrap()
+            .into_checks(Utc::now());
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (1, 0, 0, 1));
     }
 
     #[test]
@@ -1676,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_jobs_count_only_in_the_total() {
+    fn skipped_jobs_do_not_count() {
         let (p, f, pe, total) = tally([
             CheckOutcome::Passed,
             CheckOutcome::Skipped,
@@ -1684,7 +1721,7 @@ mod tests {
             CheckOutcome::Skipped,
             CheckOutcome::Pending,
         ]);
-        assert_eq!((p, f, pe, total), (1, 1, 1, 5));
+        assert_eq!((p, f, pe, total), (1, 1, 1, 3));
         let json = r#"{"headRefOid": "abc", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS",
             "contexts": {"nodes": [
@@ -1693,7 +1730,7 @@ mod tests {
         let c = serde_json::from_str::<GqlPr>(json)
             .unwrap()
             .into_checks(Utc::now());
-        assert_eq!((c.passed, c.failed, c.pending, c.total), (1, 0, 0, 2));
+        assert_eq!((c.passed, c.failed, c.pending, c.total), (1, 0, 0, 1));
     }
 
     #[test]
