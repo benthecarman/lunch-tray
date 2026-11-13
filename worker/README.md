@@ -70,12 +70,17 @@ make it, and keeps a copy of the tasks in
 reached, the tray shows the error badge and the window shows the last tasks
 it had.
 
-The app checks for changes every 10 seconds while a window is open
-(`poll_secs`), every 30 seconds with only the tray icon (`idle_poll_secs`),
-and at once when a window opens. It downloads the whole list once at start.
-After that, each check asks for what changed after the last revision it
-has. When nothing changed, the answer is an empty `304`. When something
-did, only those tasks come back.
+The app downloads the whole list once at start, then opens a WebSocket.
+The Worker pushes each change down it the moment it happens: only the tasks
+that changed, never the whole list. The socket hibernates on Cloudflare's
+side, so while nothing happens it costs nothing, and the runtime answers
+the app's pings without waking the Worker.
+
+When the socket cannot be opened or drops, the app catches up over HTTP
+and checks every 10 seconds while a window is open (`poll_secs`) and every
+30 seconds with only the tray icon (`idle_poll_secs`), asking only for what
+changed. It tries the socket again after 5 seconds, then waits twice as
+long each time, up to 5 minutes.
 
 ## MCP
 
@@ -91,9 +96,9 @@ claude mcp add --transport http lunch-tray https://lunch-tray.<your-subdomain>.w
 
 | Limit | Use |
 |---|---|
-| 100,000 requests a day | One alarm every 2 minutes (720), plus the app's checks (2,880 a day with only the tray, 8,640 with a window open), plus MCP calls |
+| 100,000 requests a day | One alarm every 2 minutes (720), one per socket the app opens, its own changes, and MCP calls. Polling, only without a socket, adds 2,880 to 8,640 |
 | 100,000 rows written a day | Only tasks that changed, plus a few rows per pass for the sync status and the revision |
-| 5,000,000 rows read a day | Two per check with no changes; the whole list (one row per task) only for each sync pass, op, and MCP call |
+| 5,000,000 rows read a day | A few per pushed change; the whole list (one row per task) only for each sync pass, op, and MCP call |
 | 50 subrequests per run | 3 searches, about one CI request per 15 open pull requests, and at most `MAX_INDIVIDUAL_CHECKS` (20) single fetches |
 | 10 ms CPU per run | See below |
 

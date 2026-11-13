@@ -82,7 +82,8 @@ poll_interval_secs = 120
 # url = "https://lunch-tray.example.workers.dev"
 # token = "..."                 # the Worker's API_TOKEN
 # token_env = "LUNCH_TRAY_REMOTE_TOKEN"
-# poll_secs = 10               # checks for changes while a window is open
+# Changes come down a WebSocket. Without one, the app checks every
+# poll_secs = 10               # seconds while a window is open
 # idle_poll_secs = 30          # and with only the tray icon
 
 # MCP server: the task list as tools for AI assistants, over HTTP at
@@ -293,7 +294,8 @@ pub struct RemoteConfig {
     pub token: Option<String>,
     #[serde(default)]
     pub token_env: Option<String>,
-    /// Seconds between checks for changes while a window is open.
+    /// Seconds between checks for changes while a window is open, when
+    /// there is no WebSocket.
     #[serde(default = "default_remote_poll")]
     pub poll_secs: u64,
     /// Seconds between checks with only the tray icon.

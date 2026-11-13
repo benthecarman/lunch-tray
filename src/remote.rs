@@ -6,17 +6,20 @@
 //! and queues it here. The Worker applies the same op with the same rules.
 //!
 //! The thread keeps `base`, the Worker's list as of revision `rev`, and
-//! asks only for what changed after that. When nothing did, the Worker
-//! answers `304` from a single row. After a change, the window's copy is
-//! `base` again, with the ops the Worker has not confirmed yet applied on
-//! top, so nothing flickers back.
+//! only ever takes what changed after that. Normally the Worker pushes
+//! each change down a WebSocket the moment it happens; while there is no
+//! socket, the thread polls over HTTP, where an unchanged list is an empty
+//! `304`. After a change, the window's copy is `base` again, with the ops
+//! the Worker has not confirmed yet applied on top, so nothing flickers
+//! back.
 
 use std::collections::VecDeque;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use lunch_tray_core::api::{self, Delta, OpBatch, OpResult};
+use anyhow::{Context, Result, anyhow, bail};
+use lunch_tray_core::api::{self, Delta, Hello, OpBatch, OpResult, Push};
 use lunch_tray_core::http::{Request, Response};
 use lunch_tray_core::model::{Snapshot, Store};
 use lunch_tray_core::ops::Op;
@@ -25,6 +28,16 @@ use lunch_tray_core::sync::SyncStatus;
 use crate::config::RemoteConfig;
 use crate::shared::{Notice, SharedRef};
 use crate::sync::Ureq;
+
+/// With a socket, how long a read waits, so commands are not held up.
+const TICK: Duration = Duration::from_millis(250);
+/// How often to ping the Worker over the socket.
+const PING_EVERY: Duration = Duration::from_secs(30);
+/// A socket this quiet, pings included, is dead.
+const SILENCE_LIMIT: Duration = Duration::from_secs(75);
+/// First wait before trying a socket again; it doubles up to `MAX_BACKOFF`.
+const MIN_BACKOFF: Duration = Duration::from_secs(5);
+const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 pub enum RemoteCmd {
     Op(Op),
@@ -94,6 +107,45 @@ impl Client {
         Ok(())
     }
 
+    /// Open the WebSocket the Worker pushes changes down.
+    fn connect(&self) -> Result<Socket> {
+        use tungstenite::client::IntoClientRequest;
+        let url = self
+            .base
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        let mut req = format!("{url}{}", api::WS).into_client_request()?;
+        req.headers_mut()
+            .insert("Authorization", format!("Bearer {}", self.token).parse()?);
+        let uri = req.uri().clone();
+        let host = uri.host().context("no host in the Worker URL")?;
+        let port = uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("wss") {
+                443
+            } else {
+                80
+            });
+        let addr = (host, port)
+            .to_socket_addrs()?
+            .next()
+            .with_context(|| format!("no address for {host}"))?;
+        let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(10))?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+        tcp.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let (ws, _) = tungstenite::client_tls_with_config(req, tcp, None, None)
+            .map_err(|e| anyhow!("open the socket: {e}"))?;
+        // From here, a read waits a tick at most.
+        tcp_of(&ws)?.set_read_timeout(Some(TICK))?;
+        let now = Instant::now();
+        Ok(Socket {
+            ws,
+            opened: now,
+            heard: now,
+            pinged: now,
+        })
+    }
+
     /// Load `snap` into the Worker. Without `replace`, only into an empty one.
     pub fn import(&self, snap: &Snapshot, replace: bool) -> Result<()> {
         let path = if replace {
@@ -109,7 +161,73 @@ impl Client {
     }
 }
 
-/// How often to check the Worker for changes.
+type Ws = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+
+fn tcp_of(ws: &Ws) -> Result<&TcpStream> {
+    use tungstenite::stream::MaybeTlsStream;
+    match ws.get_ref() {
+        MaybeTlsStream::Plain(s) => Ok(s),
+        MaybeTlsStream::Rustls(s) => Ok(s.get_ref()),
+        _ => bail!("unexpected socket kind"),
+    }
+}
+
+/// The WebSocket the Worker pushes changes down.
+struct Socket {
+    ws: Ws,
+    opened: Instant,
+    /// When the Worker last sent anything, pongs included.
+    heard: Instant,
+    pinged: Instant,
+}
+
+impl Socket {
+    fn hello(&mut self, since: u64) -> Result<()> {
+        let hello = serde_json::to_string(&Hello { since })?;
+        self.ws.send(tungstenite::Message::text(hello))?;
+        Ok(())
+    }
+
+    /// One message, or `None` after a tick without one.
+    fn read(&mut self) -> Result<Option<Push>> {
+        use tungstenite::Message;
+        let msg = match self.ws.read() {
+            Ok(msg) => msg,
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        self.heard = Instant::now();
+        match msg {
+            Message::Text(t) if t.as_str() == api::PONG => Ok(None),
+            Message::Text(t) => Ok(Some(
+                serde_json::from_str(t.as_str()).context("decode a pushed change")?,
+            )),
+            Message::Close(_) => bail!("the Worker closed the socket"),
+            _ => Ok(None),
+        }
+    }
+
+    /// Ping now and then; fail when the Worker has gone quiet.
+    fn keepalive(&mut self) -> Result<()> {
+        if self.heard.elapsed() > SILENCE_LIMIT {
+            bail!("no word from the Worker for {}s", SILENCE_LIMIT.as_secs());
+        }
+        if self.pinged.elapsed() >= PING_EVERY {
+            self.ws.send(tungstenite::Message::text(api::PING))?;
+            self.pinged = Instant::now();
+        }
+        Ok(())
+    }
+}
+
+/// How often to poll for changes while there is no socket.
 #[derive(Clone, Copy, Debug)]
 pub struct Polling {
     /// While a window is open.
@@ -122,9 +240,18 @@ pub struct Polling {
 pub fn run(client: Client, polling: Polling, shared: SharedRef, rx: Receiver<RemoteCmd>) {
     let mut link = Link::new(client, shared);
     let mut sync_now = false;
+    let mut socket: Option<Socket> = None;
+    let mut retry_at = Instant::now();
+    let mut backoff = MIN_BACKOFF;
     let mut wait = Duration::ZERO;
     loop {
-        match rx.recv_timeout(wait) {
+        // With a socket, its read further down does the waiting.
+        let timeout = if socket.is_some() {
+            Duration::ZERO
+        } else {
+            wait
+        };
+        match rx.recv_timeout(timeout) {
             Ok(RemoteCmd::Quit) | Err(RecvTimeoutError::Disconnected) => return,
             Ok(cmd) => link.take(cmd, &mut sync_now),
             Err(RecvTimeoutError::Timeout) => {}
@@ -132,20 +259,61 @@ pub fn run(client: Client, polling: Polling, shared: SharedRef, rx: Receiver<Rem
         if !link.drain(&rx, &mut sync_now) {
             return;
         }
-        wait = if link.shared.lock().unwrap().window_mode.is_some() {
+        // Ops and sync requests go over HTTP; changes too, without a socket.
+        if let Err(e) = link.round(&mut sync_now, socket.is_none()) {
+            link.went_offline(e);
+            socket = None;
+            wait = polling.idle;
+            continue;
+        }
+        link.came_online();
+
+        if socket.is_none() && link.rev != 0 && Instant::now() >= retry_at {
+            match link.client.connect().and_then(|mut s| {
+                s.hello(link.rev)?;
+                Ok(s)
+            }) {
+                Ok(s) => {
+                    log::info!("the Worker pushes changes over a socket");
+                    socket = Some(s);
+                }
+                Err(e) => {
+                    log::warn!("no socket ({e:#}); polling");
+                    retry_at = Instant::now() + backoff;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+        if let Some(s) = socket.as_mut() {
+            let r = s
+                .read()
+                .and_then(|push| match push {
+                    Some(push) => link.take_push(push, s),
+                    None => Ok(()),
+                })
+                .and_then(|()| s.keepalive());
+            if let Err(e) = r {
+                log::info!("socket closed: {e:#}");
+                // A socket that keeps dropping right away waits longer.
+                if s.opened.elapsed() > Duration::from_secs(60) {
+                    backoff = MIN_BACKOFF;
+                }
+                retry_at = Instant::now() + backoff;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                socket = None;
+                // Catch up over HTTP right away.
+                wait = Duration::ZERO;
+            }
+            continue;
+        }
+        wait = if !link.pending.is_empty() {
+            // Ops that arrived during the round go out right away.
+            Duration::ZERO
+        } else if link.shared.lock().unwrap().window_mode.is_some() {
             polling.open
         } else {
             polling.idle
         };
-        if let Err(e) = link.round(&mut sync_now) {
-            link.went_offline(e);
-            continue;
-        }
-        link.came_online();
-        // Ops that arrived during the round go out right away.
-        if !link.pending.is_empty() {
-            wait = Duration::ZERO;
-        }
     }
 }
 
@@ -165,6 +333,8 @@ struct Link {
     pending: VecDeque<Op>,
     /// Why the Worker cannot be reached, while it cannot.
     offline: Option<String>,
+    /// The newest Worker notice shown. A reconnect can repeat some.
+    notice_seq: u64,
 }
 
 impl Link {
@@ -178,6 +348,7 @@ impl Link {
             in_flight: None,
             pending: VecDeque::new(),
             offline: None,
+            notice_seq: 0,
         }
     }
 
@@ -200,8 +371,9 @@ impl Link {
         true
     }
 
-    /// Send queued ops, ask for a sync if wanted, then fetch the changes.
-    fn round(&mut self, sync_now: &mut bool) -> Result<()> {
+    /// Send queued ops, ask for a sync if wanted, then, with `fetch`, take
+    /// the changes.
+    fn round(&mut self, sync_now: &mut bool, fetch: bool) -> Result<()> {
         if self.in_flight.is_none() && !self.pending.is_empty() {
             self.in_flight = Some(OpBatch {
                 id: batch_id(),
@@ -222,8 +394,21 @@ impl Link {
             self.client.sync_now()?;
             *sync_now = false;
         }
-        if let Some(delta) = self.client.changes(self.rev)? {
+        if fetch && let Some(delta) = self.client.changes(self.rev)? {
             self.take_delta(delta);
+        }
+        Ok(())
+    }
+
+    fn take_push(&mut self, push: Push, socket: &mut Socket) -> Result<()> {
+        match push {
+            Push::Delta(delta) => self.take_delta(delta),
+            Push::Resync => {
+                log::info!("the Worker asked for a fresh start");
+                let full = self.client.changes(0)?.context("no list from the Worker")?;
+                self.take_delta(full);
+                socket.hello(self.rev)?;
+            }
         }
         Ok(())
     }
@@ -257,8 +442,12 @@ impl Link {
             let _ = op.apply(&mut s.store);
         }
         s.sync = sync;
-        if !first {
-            for n in notices {
+        for n in notices {
+            if n.seq <= self.notice_seq {
+                continue;
+            }
+            self.notice_seq = n.seq;
+            if !first {
                 s.push_notice(if n.error {
                     Notice::error(n.text)
                 } else {
@@ -327,8 +516,9 @@ mod tests {
     use super::*;
     use crate::shared::Shared;
 
-    /// Against a running Worker, such as `wrangler dev`:
-    /// `LUNCH_TRAY_TEST_WORKER=http://127.0.0.1:8787 LUNCH_TRAY_REMOTE_TOKEN=... cargo test -- --ignored`
+    /// Against a running Worker, such as `wrangler dev`, one test at a time:
+    /// `LUNCH_TRAY_TEST_WORKER=http://127.0.0.1:8787 LUNCH_TRAY_REMOTE_TOKEN=...
+    /// cargo test -- --ignored --test-threads=1`
     #[test]
     #[ignore]
     fn ops_reach_the_worker_and_come_back() {
@@ -360,7 +550,7 @@ mod tests {
         }));
         let mut link = Link::new(Client::new(&cfg).unwrap(), shared.clone());
         let mut sync_now = false;
-        link.round(&mut sync_now).unwrap();
+        link.round(&mut sync_now, true).unwrap();
         let before = shared.lock().unwrap().store.tasks().len();
         let rev = link.rev;
         assert!(rev > 0);
@@ -381,7 +571,7 @@ mod tests {
             .unwrap();
         assert!(link.drain(&remote_rx, &mut sync_now));
         assert_eq!(link.pending.len(), 1);
-        link.round(&mut sync_now).unwrap();
+        link.round(&mut sync_now, true).unwrap();
         assert!(link.pending.is_empty());
         assert!(link.rev > rev);
         {
@@ -402,7 +592,7 @@ mod tests {
         let first = link.client.ops(&again).unwrap();
         assert_eq!(link.client.ops(&again).unwrap(), first);
         let added = first[0].as_ref().unwrap().id.clone().unwrap();
-        link.round(&mut sync_now).unwrap();
+        link.round(&mut sync_now, true).unwrap();
         let count = |title: &str| {
             let s = shared.lock().unwrap();
             s.store.tasks().iter().filter(|t| t.title == title).count()
@@ -412,8 +602,69 @@ mod tests {
 
         shared.lock().unwrap().run(Op::Delete { id: id.clone() });
         assert!(link.drain(&remote_rx, &mut sync_now));
-        link.round(&mut sync_now).unwrap();
+        link.round(&mut sync_now, true).unwrap();
         assert!(shared.lock().unwrap().store.get(&id).is_none());
         assert_eq!(shared.lock().unwrap().store.tasks().len(), before);
+    }
+
+    /// Against a running Worker, like `ops_reach_the_worker_and_come_back`.
+    #[test]
+    #[ignore]
+    fn the_worker_pushes_changes_down_the_socket() {
+        let url = std::env::var("LUNCH_TRAY_TEST_WORKER").expect("LUNCH_TRAY_TEST_WORKER");
+        let cfg = RemoteConfig {
+            url,
+            token: None,
+            token_env: None,
+            poll_secs: 1,
+            idle_poll_secs: 1,
+        };
+        let client = Client::new(&cfg).unwrap();
+        let rev = client.changes(0).unwrap().unwrap().rev;
+        let mut socket = client.connect().unwrap();
+        socket.hello(rev).unwrap();
+
+        let title = format!("pushed {}", chrono::Utc::now().timestamp_millis());
+        let batch = OpBatch {
+            id: batch_id(),
+            ops: vec![Op::Add {
+                title: title.clone(),
+                notes: String::new(),
+                link: None,
+            }],
+        };
+        let id = client.ops(&batch).unwrap()[0]
+            .as_ref()
+            .unwrap()
+            .id
+            .clone()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let delta = loop {
+            assert!(Instant::now() < deadline, "no push within 10s");
+            if let Some(Push::Delta(d)) = socket.read().unwrap() {
+                break d;
+            }
+        };
+        assert!(!delta.full);
+        assert!(delta.rev > rev);
+        assert!(delta.tasks.iter().any(|t| t.title == title));
+
+        // Pings come back as pongs, which count as hearing from it.
+        socket.pinged = Instant::now() - PING_EVERY;
+        let before = socket.heard;
+        socket.keepalive().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while socket.heard == before {
+            assert!(Instant::now() < deadline, "no pong within 5s");
+            // Other changes may arrive meanwhile.
+            socket.read().unwrap();
+        }
+
+        let delete = OpBatch {
+            id: batch_id(),
+            ops: vec![Op::Delete { id }],
+        };
+        client.ops(&delete).unwrap();
     }
 }

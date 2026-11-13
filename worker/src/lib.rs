@@ -6,6 +6,10 @@
 //! uses at `/api/*`, see `lunch_tray_core::api`. The Worker in front checks
 //! the bearer token and hands everything else to the object.
 //!
+//! The app keeps a hibernating WebSocket open at `/api/ws`, and the object
+//! pushes each change down it. An idle socket costs nothing: the object
+//! sleeps, and the runtime answers pings by itself.
+//!
 //! The object goes to sleep between requests, so it does not count on
 //! memory. Every change takes the next revision number, kept in SQLite, and
 //! each task row keeps the revision of its last change. The app asks for
@@ -20,7 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use lunch_tray_core::api::{self, OpBatch, OpResult, RemoteNotice};
+use lunch_tray_core::api::{self, Hello, OpBatch, OpResult, RemoteNotice};
 use lunch_tray_core::http::{Request as HttpRequest, Response as HttpResponse, Transport};
 use lunch_tray_core::mcp::{self, Backend, Incoming};
 use lunch_tray_core::model::{OnClose, Snapshot, Store, Task};
@@ -32,7 +36,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use worker::{
     Date, DurableObject, Env, Fetch, Headers, Method, Request, RequestInit, Response, Result,
-    SqlStorage, SqlStorageValue, State, durable_object, event, wasm_bindgen::JsValue,
+    SqlStorage, SqlStorageValue, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    durable_object, event, wasm_bindgen::JsValue,
 };
 
 type Forges = Rc<Vec<Box<dyn Forge>>>;
@@ -90,14 +95,20 @@ async fn fetch(req: Request, env: Env, _ctx: worker::Context) -> Result<Response
 
 #[durable_object]
 pub struct Tray {
-    state: State,
+    state: Rc<State>,
     env: Env,
     core: Rc<Core>,
 }
 
 impl DurableObject for Tray {
     fn new(state: State, env: Env) -> Self {
-        let core = Core::new(state.storage().sql()).expect("open the database");
+        let state = Rc::new(state);
+        // Keeps sockets alive without waking the object.
+        match worker::worker_sys::WebSocketRequestResponsePair::new(api::PING, api::PONG) {
+            Ok(pair) => state.set_websocket_auto_response(&pair),
+            Err(e) => log::error!("ping auto-response: {e:?}"),
+        }
+        let core = Core::new(state.clone()).expect("open the database");
         Tray {
             state,
             env,
@@ -107,16 +118,16 @@ impl DurableObject for Tray {
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         let path = req.path();
-        // The app's polls only read; everything else makes sure the sync
-        // alarm is booked, which also starts it on a new Worker.
-        if !(req.method() == Method::Get && path == api::STATE)
-            && self.state.storage().get_alarm().await?.is_none()
-        {
+        // The app's reads leave the alarm alone; everything else makes sure
+        // the sync alarm is booked, which also starts it on a new Worker.
+        let read = req.method() == Method::Get && (path == api::STATE || path == api::WS);
+        if !read && self.state.storage().get_alarm().await?.is_none() {
             self.state.storage().set_alarm(1000).await?;
         }
         let resp = match (req.method(), path.as_str()) {
             (_, mcp::PATH) => self.mcp(&mut req).await,
             (Method::Get, api::STATE) => self.api_state(&req),
+            (Method::Get, api::WS) => self.api_ws(&req),
             (Method::Post, api::OPS) => self.api_ops(&mut req).await,
             (Method::Post, api::SYNC) => {
                 self.core.sync_requested.set(true);
@@ -140,6 +151,43 @@ impl DurableObject for Tray {
             .await?;
         self.core.sync(&self.env, &cfg).await;
         Response::ok("synced")
+    }
+
+    /// The app's `Hello`: remember its revision, and catch it up.
+    async fn websocket_message(&self, ws: WebSocket, msg: WebSocketIncomingMessage) -> Result<()> {
+        let WebSocketIncomingMessage::String(text) = msg else {
+            return Ok(());
+        };
+        match serde_json::from_str::<Hello>(&text) {
+            Ok(hello) => {
+                ws.serialize_attachment(Some(hello.since))?;
+                self.core.push_to(&ws)?;
+            }
+            Err(e) => log::warn!("socket said {text:?}: {e}"),
+        }
+        Ok(())
+    }
+
+    async fn websocket_close(
+        &self,
+        ws: WebSocket,
+        code: usize,
+        _reason: String,
+        _was_clean: bool,
+    ) -> Result<()> {
+        // Finish the close handshake; 1005 and 1006 cannot be sent back.
+        let code = if code == 1005 || code == 1006 {
+            1000
+        } else {
+            code
+        };
+        let _ = ws.close(Some(code as u16), Some("bye"));
+        Ok(())
+    }
+
+    async fn websocket_error(&self, _ws: WebSocket, error: worker::Error) -> Result<()> {
+        log::warn!("socket error: {error}");
+        Ok(())
     }
 }
 
@@ -177,8 +225,7 @@ impl Tray {
         Ok(resp.with_status(reply.status).with_headers(out))
     }
 
-    /// What changed after `?since=`, straight from the rows: tasks are
-    /// passed through as stored, never parsed.
+    /// What changed after `?since=`; see `Core::delta`.
     fn api_state(&self, req: &Request) -> Result<Response> {
         let since: u64 = req
             .url()?
@@ -186,58 +233,24 @@ impl Tray {
             .find(|(k, _)| k == "since")
             .and_then(|(_, v)| v.parse().ok())
             .unwrap_or(0);
-        let core = &self.core;
-        let rev = core.rev()?;
-        if since != 0 && since == rev {
-            let headers = Headers::new();
-            headers.set("Cache-Control", "no-store")?;
-            return Ok(Response::empty()?.with_status(304).with_headers(headers));
+        match self.core.delta(since)? {
+            None => {
+                let headers = Headers::new();
+                headers.set("Cache-Control", "no-store")?;
+                Ok(Response::empty()?.with_status(304).with_headers(headers))
+            }
+            Some(delta) => json_response(serde_json::to_string(&delta).map_err(|e| e.to_string())?),
         }
-        let full_since: u64 = core.meta_u64("full_since")?;
-        let full = since == 0 || since > rev || since < full_since;
-        let sql = &core.sql;
-        let tasks: Vec<JsonRow> = if full {
-            sql.exec("SELECT json FROM tasks", None)?.to_array()?
-        } else {
-            sql.exec("SELECT json FROM tasks WHERE rev > ?", vec![int(since)])?
-                .to_array()?
-        };
-        let removed: Vec<IdRow> = if full {
-            Vec::new()
-        } else {
-            sql.exec("SELECT id FROM removed WHERE rev > ?", vec![int(since)])?
-                .to_array()?
-        };
-        // On first contact, what happened before is old news.
-        let notices: Vec<NoticeRow> = if since == 0 {
-            Vec::new()
-        } else {
-            sql.exec(
-                "SELECT rev, error, text FROM notices WHERE rev > ? ORDER BY rev",
-                vec![int(since)],
-            )?
-            .to_array()?
-        };
-        let out = DeltaOut {
-            rev,
-            full,
-            tasks: tasks
-                .into_iter()
-                .filter_map(|r| RawValue::from_string(r.json).ok())
-                .collect(),
-            removed: removed.into_iter().map(|r| r.id).collect(),
-            next_manual_id: core.meta_u64("next_manual_id")?,
-            sync: core.sync_status()?,
-            notices: notices
-                .into_iter()
-                .map(|n| RemoteNotice {
-                    seq: n.rev as u64,
-                    error: n.error != 0,
-                    text: n.text,
-                })
-                .collect(),
-        };
-        json_response(serde_json::to_string(&out).map_err(|e| e.to_string())?)
+    }
+
+    /// Accept a socket for pushed changes. It hibernates with the object.
+    fn api_ws(&self, req: &Request) -> Result<Response> {
+        if req.headers().get("Upgrade")?.as_deref() != Some("websocket") {
+            return Response::error("expected a WebSocket upgrade", 426);
+        }
+        let pair = WebSocketPair::new()?;
+        self.state.accept_web_socket(&pair.server);
+        Response::from_websocket(pair.client)
     }
 
     async fn api_ops(&self, req: &mut Request) -> Result<Response> {
@@ -295,6 +308,15 @@ impl Tray {
     }
 }
 
+/// `api::Push::Delta`: the delta and its `type`.
+#[derive(Serialize)]
+struct PushOut<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(flatten)]
+    delta: &'a DeltaOut,
+}
+
 /// `api::Delta`, with the tasks as stored JSON.
 #[derive(Serialize)]
 struct DeltaOut {
@@ -347,6 +369,7 @@ struct Loaded {
 /// so requests that arrive while a sync waits on GitHub are served
 /// meanwhile.
 struct Core {
+    state: Rc<State>,
     sql: SqlStorage,
     loaded: RefCell<Option<Loaded>>,
     /// The current revision, once read.
@@ -357,9 +380,10 @@ struct Core {
 }
 
 impl Core {
-    fn new(sql: SqlStorage) -> Result<Self> {
+    fn new(state: Rc<State>) -> Result<Self> {
         let core = Core {
-            sql,
+            sql: state.storage().sql(),
+            state,
             loaded: RefCell::new(None),
             rev: Cell::new(None),
             sync: RefCell::new(None),
@@ -410,6 +434,100 @@ impl Core {
         self.set_meta("schema", &SCHEMA.to_string());
         log::info!("database schema {from} -> {SCHEMA}");
         Ok(())
+    }
+
+    /// What changed after revision `since`, or `None` when nothing did.
+    /// Tasks are passed through as stored, never parsed. `since = 0`, or a
+    /// revision from before an import, gets the whole list.
+    fn delta(&self, since: u64) -> Result<Option<DeltaOut>> {
+        let rev = self.rev()?;
+        if since != 0 && since == rev {
+            return Ok(None);
+        }
+        let full = self.needs_full(since)?;
+        let sql = &self.sql;
+        let tasks: Vec<JsonRow> = if full {
+            sql.exec("SELECT json FROM tasks", None)?.to_array()?
+        } else {
+            sql.exec("SELECT json FROM tasks WHERE rev > ?", vec![int(since)])?
+                .to_array()?
+        };
+        let removed: Vec<IdRow> = if full {
+            Vec::new()
+        } else {
+            sql.exec("SELECT id FROM removed WHERE rev > ?", vec![int(since)])?
+                .to_array()?
+        };
+        // On first contact, what happened before is old news.
+        let notices: Vec<NoticeRow> = if since == 0 {
+            Vec::new()
+        } else {
+            sql.exec(
+                "SELECT rev, error, text FROM notices WHERE rev > ? ORDER BY rev",
+                vec![int(since)],
+            )?
+            .to_array()?
+        };
+        let out = DeltaOut {
+            rev,
+            full,
+            tasks: tasks
+                .into_iter()
+                .filter_map(|r| RawValue::from_string(r.json).ok())
+                .collect(),
+            removed: removed.into_iter().map(|r| r.id).collect(),
+            next_manual_id: self.meta_u64("next_manual_id")?,
+            sync: self.sync_status()?,
+            notices: notices
+                .into_iter()
+                .map(|n| RemoteNotice {
+                    seq: n.rev as u64,
+                    error: n.error != 0,
+                    text: n.text,
+                })
+                .collect(),
+        };
+        Ok(Some(out))
+    }
+
+    /// True when a copy at `since` must start over from the whole list.
+    fn needs_full(&self, since: u64) -> Result<bool> {
+        Ok(since == 0 || since > self.rev()? || since < self.meta_u64("full_since")?)
+    }
+
+    /// Bring one socket up to date: a delta when it is behind, `resync`
+    /// when a delta would be the whole list. The socket's attachment holds
+    /// the revision it has, or nothing before its `Hello` and after a
+    /// `resync` until the next `Hello`.
+    fn push_to(&self, ws: &WebSocket) -> Result<()> {
+        let Some(since) = ws.deserialize_attachment::<Option<u64>>()?.flatten() else {
+            return Ok(());
+        };
+        if self.needs_full(since)? {
+            ws.send_with_str(r#"{"type":"resync"}"#)?;
+            ws.serialize_attachment(None::<u64>)?;
+            return Ok(());
+        }
+        let Some(delta) = self.delta(since)? else {
+            return Ok(());
+        };
+        let text = serde_json::to_string(&PushOut {
+            kind: "delta",
+            delta: &delta,
+        })
+        .map_err(|e| e.to_string())?;
+        ws.send_with_str(text)?;
+        ws.serialize_attachment(Some(delta.rev))?;
+        Ok(())
+    }
+
+    /// Bring every open socket up to date, after a change.
+    fn broadcast(&self) {
+        for ws in self.state.get_websockets() {
+            if let Err(e) = self.push_to(&ws) {
+                log::warn!("push: {e}");
+            }
+        }
     }
 
     fn meta(&self, key: &str) -> Result<Option<String>> {
@@ -550,6 +668,11 @@ impl Core {
             self.set_meta("next_manual_id", &next_id.to_string());
             *saved_next_id = next_id;
         }
+        let changed = rev.is_some();
+        drop(guard);
+        if changed {
+            self.broadcast();
+        }
     }
 
     fn apply(&self, op: Op) -> OpResult {
@@ -578,6 +701,7 @@ impl Core {
         self.set_meta("sync", &serde_json::to_string(&s).unwrap_or_default());
         *self.sync.borrow_mut() = Some(s);
         self.bump();
+        self.broadcast();
     }
 
     fn push_notice(&self, error: bool, text: String) {
@@ -598,6 +722,7 @@ impl Core {
         if let Err(e) = saved {
             log::error!("save notice: {e}");
         }
+        self.broadcast();
     }
 
     fn forges(&self, env: &Env, cfg: &WorkerConfig) -> Forges {
