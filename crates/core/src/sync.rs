@@ -37,6 +37,12 @@ pub trait Forge {
     fn quota_low(&self) -> bool {
         false
     }
+    /// What the host said about its rate limits, to keep across restarts.
+    fn limits(&self) -> Limits {
+        Limits::default()
+    }
+    /// Take back limits from an earlier `limits()`.
+    fn restore_limits(&self, _limits: Limits) {}
     /// CI and merge state for these open pull requests. Items the forge
     /// cannot answer for are simply left out.
     async fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>>;
@@ -78,11 +84,22 @@ pub struct Http {
     paused_until: Mutex<Option<DateTime<Utc>>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Quota {
     limit: u64,
     remaining: u64,
     reset: DateTime<Utc>,
+}
+
+/// A host's rate limits as last heard: the quota per resource, and when
+/// it said to stop until. Held in memory; the Worker, which restarts often,
+/// saves it between passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    #[serde(default)]
+    quotas: HashMap<String, Quota>,
+    #[serde(default)]
+    paused_until: Option<DateTime<Utc>>,
 }
 
 /// GitHub's rate-limit headers, when present.
@@ -124,6 +141,22 @@ impl Http {
             }
             None => None,
         }
+    }
+
+    fn limits(&self) -> Limits {
+        Limits {
+            quotas: self
+                .quotas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            paused_until: self.paused(),
+        }
+    }
+
+    fn restore_limits(&self, limits: Limits) {
+        *self.quotas.lock().unwrap_or_else(|e| e.into_inner()) = limits.quotas;
+        *self.paused_until.lock().unwrap_or_else(|e| e.into_inner()) = limits.paused_until;
     }
 
     fn pause_until(&self, until: DateTime<Utc>) {
@@ -581,6 +614,14 @@ impl Forge for GitHub {
 
     fn quota_low(&self) -> bool {
         self.http.quota_low()
+    }
+
+    fn limits(&self) -> Limits {
+        self.http.limits()
+    }
+
+    fn restore_limits(&self, limits: Limits) {
+        self.http.restore_limits(limits);
     }
 
     /// Batches of `GRAPHQL_BATCH` pull requests per GraphQL request: each
@@ -1447,6 +1488,13 @@ mod tests {
         assert!(http.paused().is_none());
         http.pause_until(Utc::now() + chrono::Duration::minutes(1));
         assert!(http.paused().is_some());
+
+        // Saved and restored, as the Worker does across restarts.
+        let saved = serde_json::to_string(&http.limits()).unwrap();
+        let fresh = Http::new(Box::new(NoNet));
+        fresh.restore_limits(serde_json::from_str(&saved).unwrap());
+        assert!(fresh.quota_low());
+        assert!(fresh.paused().is_some());
     }
 
     #[test]

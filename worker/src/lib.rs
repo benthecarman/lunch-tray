@@ -30,7 +30,7 @@ use lunch_tray_core::mcp::{self, Backend, Incoming};
 use lunch_tray_core::model::{OnClose, Snapshot, Store, Task};
 use lunch_tray_core::ops::{Applied, Op};
 use lunch_tray_core::sync::{
-    Forge, GitHub, SyncHost, SyncOptions, SyncStatus, default_github_queries, sync_once,
+    Forge, GitHub, Limits, SyncHost, SyncOptions, SyncStatus, default_github_queries, sync_once,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -759,7 +759,27 @@ impl Core {
         // The object starts fresh for most passes, so take the turn for
         // individual checks from the clock rather than a counter.
         let round = (Utc::now().timestamp() as u64 / cfg.poll_interval_secs) as usize;
+        // GitHub's quotas and any "stop until" outlive this instance.
+        let saved: HashMap<String, Limits> = self
+            .meta("limits")
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+        for f in forges.iter() {
+            if let Some(l) = saved.get(&f.host()) {
+                f.restore_limits(l.clone());
+            }
+        }
         let errors = sync_once(&forges, self, opts, round).await;
+        let limits: HashMap<String, Limits> =
+            forges.iter().map(|f| (f.host(), f.limits())).collect();
+        if limits != saved {
+            self.set_meta(
+                "limits",
+                &serde_json::to_string(&limits).unwrap_or_default(),
+            );
+        }
         let old = self.sync_status().unwrap_or_default().errors;
         let changed = old != errors;
         self.set_sync_status(|s| {
