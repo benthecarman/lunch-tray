@@ -131,6 +131,13 @@ impl Shared {
         }
     }
 
+    /// Ask the Worker link to check for changes now.
+    pub fn refresh_remote(&self) {
+        if let Some(tx) = &self.remote {
+            let _ = tx.send(RemoteCmd::Refresh);
+        }
+    }
+
     /// Apply a change: to the store here at once, saved to disk, and sent
     /// on to the Worker when there is one.
     pub fn apply(&mut self, op: Op) -> Result<Applied, String> {

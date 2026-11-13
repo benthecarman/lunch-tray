@@ -425,6 +425,21 @@ impl Store {
         self.data.next_manual_id = snap.next_manual_id;
     }
 
+    /// Patch in a remote copy's changes: drop `removed`, then add or
+    /// replace `changed` by id. Settings stay.
+    pub fn apply_delta(&mut self, changed: Vec<Task>, removed: &[String], next_manual_id: u64) {
+        if !removed.is_empty() {
+            self.data.tasks.retain(|t| !removed.contains(&t.id));
+        }
+        for task in changed {
+            match self.data.tasks.iter_mut().find(|t| t.id == task.id) {
+                Some(t) => *t = task,
+                None => self.data.tasks.push(task),
+            }
+        }
+        self.data.next_manual_id = next_manual_id;
+    }
+
     pub fn next_manual_id(&self) -> u64 {
         self.data.next_manual_id
     }
@@ -916,6 +931,27 @@ fn running_message(t: &Task, verb: &str) -> String {
 mod tests {
     use super::*;
     use chrono::Duration;
+
+    #[test]
+    fn a_delta_patches_the_copy() {
+        let mut s = Store::in_memory();
+        let a = s.add_manual("a", "", None);
+        let b = s.add_manual("b", "", None);
+        let mut source = Store::from_snapshot(s.snapshot());
+        source.rename(&a, "a2").unwrap();
+        source.delete(&b).unwrap();
+        let c = source.add_manual("c", "", None);
+        let changed: Vec<Task> = [&a, &c]
+            .iter()
+            .map(|id| source.get(id).unwrap().clone())
+            .collect();
+        s.apply_delta(changed, std::slice::from_ref(&b), source.next_manual_id());
+        assert_eq!(s.snapshot(), source.snapshot());
+        // A removal and a re-add in the same delta leave the task there.
+        let again = s.get(&a).unwrap().clone();
+        s.apply_delta(vec![again], std::slice::from_ref(&a), 3);
+        assert!(s.get(&a).is_some());
+    }
 
     fn remote(number: u64, state: RemoteState, updated: DateTime<Utc>) -> RemoteItem {
         RemoteItem {

@@ -192,12 +192,15 @@ fn main() -> anyhow::Result<()> {
             }
             match remote::Client::new(remote_cfg) {
                 Ok(client) => {
-                    let poll = Duration::from_secs(remote_cfg.poll_secs.max(2));
+                    let polling = remote::Polling {
+                        open: Duration::from_secs(remote_cfg.poll_secs.max(2)),
+                        idle: Duration::from_secs(remote_cfg.idle_poll_secs.max(2)),
+                    };
                     let shared = shared.clone();
                     log::info!("tasks live on {}", remote_cfg.url);
                     std::thread::Builder::new()
                         .name("remote".into())
-                        .spawn(move || remote::run(client, poll, shared, remote_rx))?;
+                        .spawn(move || remote::run(client, polling, shared, remote_rx))?;
                 }
                 Err(e) => shared
                     .lock()
@@ -236,6 +239,8 @@ fn main() -> anyhow::Result<()> {
     loop {
         if let Some((mode, open_add)) = next.take() {
             log::info!("open {mode:?} window");
+            // Show what changed while only the tray was up.
+            shared.lock().unwrap().refresh_remote();
             if let Err(e) = ui::run_window(shared.clone(), mode, open_add) {
                 log::error!("window: {e}");
             }

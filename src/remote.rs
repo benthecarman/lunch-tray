@@ -1,21 +1,26 @@
 //! The link to a Lunch Tray Worker. The Worker owns the tasks and runs the
-//! sync; this thread sends it the changes made here and brings its state
-//! back into `Shared`, where the window and the tray read it as before.
+//! sync; this thread sends it the changes made here and brings its changes
+//! back into `Shared`, where the window and the tray read them as before.
 //!
 //! A change shows at once: `Shared::apply` runs the op on the local copy
-//! and queues it here. The Worker applies the same op with the same rules,
-//! and its next state replaces the local copy. Ops not yet sent are
-//! applied again on top of each new state, so nothing flickers back.
+//! and queues it here. The Worker applies the same op with the same rules.
+//!
+//! The thread keeps `base`, the Worker's list as of revision `rev`, and
+//! asks only for what changed after that. When nothing did, the Worker
+//! answers `304` from a single row. After a change, the window's copy is
+//! `base` again, with the ops the Worker has not confirmed yet applied on
+//! top, so nothing flickers back.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use lunch_tray_core::api::{self, OpBatch, OpResult, State};
+use lunch_tray_core::api::{self, Delta, OpBatch, OpResult};
 use lunch_tray_core::http::{Request, Response};
 use lunch_tray_core::model::{Snapshot, Store};
 use lunch_tray_core::ops::Op;
+use lunch_tray_core::sync::SyncStatus;
 
 use crate::config::RemoteConfig;
 use crate::shared::{Notice, SharedRef};
@@ -24,6 +29,8 @@ use crate::sync::Ureq;
 pub enum RemoteCmd {
     Op(Op),
     SyncNow,
+    /// Check for changes now, say because a window opened.
+    Refresh,
     Quit,
 }
 
@@ -42,22 +49,13 @@ impl Client {
         })
     }
 
-    fn send(
-        &self,
-        method: &'static str,
-        path: &str,
-        body: Option<String>,
-        etag: Option<&str>,
-    ) -> Result<Response> {
+    fn send(&self, method: &'static str, path: &str, body: Option<String>) -> Result<Response> {
         let mut headers = vec![(
             "Authorization".to_string(),
             format!("Bearer {}", self.token),
         )];
         if body.is_some() {
             headers.push(("Content-Type".into(), "application/json".into()));
-        }
-        if let Some(etag) = etag {
-            headers.push(("If-None-Match".into(), etag.to_string()));
         }
         let url = format!("{}{path}", self.base);
         let resp = self
@@ -76,23 +74,23 @@ impl Client {
         }
     }
 
-    /// The Worker's state, or `None` when it still matches `etag`.
-    fn state(&self, etag: Option<&str>) -> Result<Option<(State, Option<String>)>> {
-        let resp = self.send("GET", api::STATE, None, etag)?;
+    /// What changed after revision `since`, or `None` when nothing did.
+    fn changes(&self, since: u64) -> Result<Option<Delta>> {
+        let resp = self.send("GET", &format!("{}?since={since}", api::STATE), None)?;
         if resp.status == 304 {
             return Ok(None);
         }
-        let state: State = serde_json::from_str(&resp.body).context("decode the Worker's state")?;
-        Ok(Some((state, resp.header("etag").map(str::to_string))))
+        let delta = serde_json::from_str(&resp.body).context("decode the Worker's changes")?;
+        Ok(Some(delta))
     }
 
     fn ops(&self, batch: &OpBatch) -> Result<Vec<OpResult>> {
-        let resp = self.send("POST", api::OPS, Some(serde_json::to_string(batch)?), None)?;
+        let resp = self.send("POST", api::OPS, Some(serde_json::to_string(batch)?))?;
         serde_json::from_str(&resp.body).context("decode the Worker's answer")
     }
 
     fn sync_now(&self) -> Result<()> {
-        self.send("POST", api::SYNC, Some("{}".into()), None)?;
+        self.send("POST", api::SYNC, Some("{}".into()))?;
         Ok(())
     }
 
@@ -103,7 +101,7 @@ impl Client {
         } else {
             api::IMPORT.to_string()
         };
-        let resp = self.send("PUT", &path, Some(serde_json::to_string(snap)?), None)?;
+        let resp = self.send("PUT", &path, Some(serde_json::to_string(snap)?))?;
         if resp.status == 409 {
             bail!("the Worker already has tasks; use --upload --replace to overwrite them");
         }
@@ -111,17 +109,18 @@ impl Client {
     }
 }
 
+/// How often to check the Worker for changes.
+#[derive(Clone, Copy, Debug)]
+pub struct Polling {
+    /// While a window is open.
+    pub open: Duration,
+    /// With only the tray icon.
+    pub idle: Duration,
+}
+
 /// Runs until `Quit` arrives or the sender goes away.
-pub fn run(client: Client, poll: Duration, shared: SharedRef, rx: Receiver<RemoteCmd>) {
-    let mut link = Link {
-        client,
-        shared,
-        in_flight: None,
-        pending: VecDeque::new(),
-        etag: None,
-        seen: None,
-        offline: None,
-    };
+pub fn run(client: Client, polling: Polling, shared: SharedRef, rx: Receiver<RemoteCmd>) {
+    let mut link = Link::new(client, shared);
     let mut sync_now = false;
     let mut wait = Duration::ZERO;
     loop {
@@ -130,17 +129,20 @@ pub fn run(client: Client, poll: Duration, shared: SharedRef, rx: Receiver<Remot
             Ok(cmd) => link.take(cmd, &mut sync_now),
             Err(RecvTimeoutError::Timeout) => {}
         }
-        wait = poll;
         if !link.drain(&rx, &mut sync_now) {
             return;
         }
+        wait = if link.shared.lock().unwrap().window_mode.is_some() {
+            polling.open
+        } else {
+            polling.idle
+        };
         if let Err(e) = link.round(&mut sync_now) {
             link.went_offline(e);
             continue;
         }
         link.came_online();
-        // A state fetch can arrive after ops queued meanwhile; those are
-        // already pending and applied on top. Check again soon to send them.
+        // Ops that arrived during the round go out right away.
         if !link.pending.is_empty() {
             wait = Duration::ZERO;
         }
@@ -150,24 +152,40 @@ pub fn run(client: Client, poll: Duration, shared: SharedRef, rx: Receiver<Remot
 struct Link {
     client: Client,
     shared: SharedRef,
+    /// The Worker's list as of `rev`, without local changes.
+    base: Store,
+    /// The Worker revision `base` is at; 0 before the first answer.
+    rev: u64,
+    /// The Worker's own sync status, to restore after being offline.
+    worker_sync: SyncStatus,
     /// Ops sent but not yet answered. A failed send is retried with the
     /// same batch, so the Worker can tell it already applied them.
     in_flight: Option<OpBatch>,
     /// Ops applied here and not yet sent.
     pending: VecDeque<Op>,
-    etag: Option<String>,
-    /// The newest Worker notice shown, as (boot, seq).
-    seen: Option<(u64, u64)>,
     /// Why the Worker cannot be reached, while it cannot.
     offline: Option<String>,
 }
 
 impl Link {
+    fn new(client: Client, shared: SharedRef) -> Self {
+        Link {
+            client,
+            shared,
+            base: Store::in_memory(),
+            rev: 0,
+            worker_sync: SyncStatus::default(),
+            in_flight: None,
+            pending: VecDeque::new(),
+            offline: None,
+        }
+    }
+
     fn take(&mut self, cmd: RemoteCmd, sync_now: &mut bool) {
         match cmd {
             RemoteCmd::Op(op) => self.pending.push_back(op),
             RemoteCmd::SyncNow => *sync_now = true,
-            RemoteCmd::Quit => {}
+            RemoteCmd::Refresh | RemoteCmd::Quit => {}
         }
     }
 
@@ -182,7 +200,7 @@ impl Link {
         true
     }
 
-    /// Send queued ops, ask for a sync if wanted, then fetch the state.
+    /// Send queued ops, ask for a sync if wanted, then fetch the changes.
     fn round(&mut self, sync_now: &mut bool) -> Result<()> {
         if self.in_flight.is_none() && !self.pending.is_empty() {
             self.in_flight = Some(OpBatch {
@@ -195,50 +213,59 @@ impl Link {
             self.in_flight = None;
             for r in results {
                 if let Err(e) = r {
-                    // The Worker refused: its state wins on the next fetch.
+                    // The Worker refused: its list wins with the next changes.
                     self.notice(Notice::error(e));
                 }
             }
-            self.etag = None;
         }
         if *sync_now {
             self.client.sync_now()?;
             *sync_now = false;
         }
-        if let Some((state, etag)) = self.client.state(self.etag.as_deref())? {
-            self.etag = etag;
-            self.take_state(state);
+        if let Some(delta) = self.client.changes(self.rev)? {
+            self.take_delta(delta);
         }
         Ok(())
     }
 
-    fn take_state(&mut self, state: State) {
+    fn take_delta(&mut self, delta: Delta) {
+        let first = self.rev == 0;
+        self.rev = delta.rev;
+        self.worker_sync = delta.sync.clone();
+        let Delta {
+            full,
+            tasks,
+            removed,
+            next_manual_id,
+            sync,
+            notices,
+            ..
+        } = delta;
+        if full {
+            self.base.replace_with(Snapshot {
+                tasks,
+                next_manual_id,
+            });
+        } else {
+            self.base.apply_delta(tasks, &removed, next_manual_id);
+        }
         let mut s = self.shared.lock().unwrap();
-        s.store.replace_with(state.snapshot);
+        s.store.replace_with(self.base.snapshot());
         // Changes the Worker has not confirmed yet go on top.
         let unconfirmed = self.in_flight.iter().flat_map(|b| b.ops.iter());
         for op in unconfirmed.chain(self.pending.iter()) {
             let _ = op.apply(&mut s.store);
         }
-        s.sync = state.sync;
-        let new: Vec<_> = match self.seen {
-            // First contact: what happened before is old news.
-            None => Vec::new(),
-            Some((boot, seq)) if boot == state.boot => {
-                state.notices.iter().filter(|n| n.seq > seq).collect()
+        s.sync = sync;
+        if !first {
+            for n in notices {
+                s.push_notice(if n.error {
+                    Notice::error(n.text)
+                } else {
+                    Notice::info(n.text)
+                });
             }
-            // The Worker restarted; its notices are all new.
-            Some(_) => state.notices.iter().collect(),
-        };
-        for n in new {
-            s.push_notice(if n.error {
-                Notice::error(n.text.clone())
-            } else {
-                Notice::info(n.text.clone())
-            });
         }
-        let last = state.notices.last().map_or(0, |n| n.seq);
-        self.seen = Some((state.boot, last));
         s.save_store();
         s.notify();
     }
@@ -258,13 +285,14 @@ impl Link {
         s.sync.in_progress = false;
         s.notify();
         self.offline = Some(why);
-        // Fetch in full once back, so the Worker's own status replaces ours.
-        self.etag = None;
     }
 
     fn came_online(&mut self) {
         if self.offline.take().is_some() {
             log::info!("Worker reachable again");
+            let mut s = self.shared.lock().unwrap();
+            s.sync = self.worker_sync.clone();
+            s.notify();
         }
     }
 }
@@ -310,6 +338,7 @@ mod tests {
             token: None,
             token_env: None,
             poll_secs: 1,
+            idle_poll_secs: 1,
         };
         let (main_tx, _) = channel();
         let (sync_tx, _) = channel();
@@ -329,18 +358,14 @@ mod tests {
             sync_tx,
             remote: Some(remote_tx.clone()),
         }));
-        let mut link = Link {
-            client: Client::new(&cfg).unwrap(),
-            shared: shared.clone(),
-            in_flight: None,
-            pending: VecDeque::new(),
-            etag: None,
-            seen: None,
-            offline: None,
-        };
+        let mut link = Link::new(Client::new(&cfg).unwrap(), shared.clone());
         let mut sync_now = false;
         link.round(&mut sync_now).unwrap();
         let before = shared.lock().unwrap().store.tasks().len();
+        let rev = link.rev;
+        assert!(rev > 0);
+        // Nothing changed: a 304, not a list.
+        assert!(link.client.changes(rev).unwrap().is_none());
 
         let title = format!("remote test {}", chrono::Utc::now().timestamp_millis());
         let id = shared
@@ -358,6 +383,7 @@ mod tests {
         assert_eq!(link.pending.len(), 1);
         link.round(&mut sync_now).unwrap();
         assert!(link.pending.is_empty());
+        assert!(link.rev > rev);
         {
             let s = shared.lock().unwrap();
             assert_eq!(s.store.tasks().len(), before + 1);
@@ -376,7 +402,6 @@ mod tests {
         let first = link.client.ops(&again).unwrap();
         assert_eq!(link.client.ops(&again).unwrap(), first);
         let added = first[0].as_ref().unwrap().id.clone().unwrap();
-        link.etag = None;
         link.round(&mut sync_now).unwrap();
         let count = |title: &str| {
             let s = shared.lock().unwrap();

@@ -64,11 +64,18 @@ systemctl --user restart lunch-tray
 `--upload` only fills an empty Worker. `--upload --replace` overwrites it.
 
 With `[remote]`, the app no longer syncs on its own. It also ignores
-`[[github]]`, `[[forgejo]]`, and `[mcp]`. It checks the Worker every 10
-seconds (`poll_secs`). It sends a change the moment you make it, and keeps
-a copy of the tasks in `~/.local/share/lunch-tray/remote-cache.json`. When
-the Worker cannot be reached, the tray shows the error badge and the window
-shows the last tasks it had.
+`[[github]]`, `[[forgejo]]`, and `[mcp]`. It sends a change the moment you
+make it, and keeps a copy of the tasks in
+`~/.local/share/lunch-tray/remote-cache.json`. When the Worker cannot be
+reached, the tray shows the error badge and the window shows the last tasks
+it had.
+
+The app checks for changes every 10 seconds while a window is open
+(`poll_secs`), every 30 seconds with only the tray icon (`idle_poll_secs`),
+and at once when a window opens. It downloads the whole list once at start.
+After that, each check asks for what changed after the last revision it
+has. When nothing changed, the answer is an empty `304`. When something
+did, only those tasks come back.
 
 ## MCP
 
@@ -84,15 +91,17 @@ claude mcp add --transport http lunch-tray https://lunch-tray.<your-subdomain>.w
 
 | Limit | Use |
 |---|---|
-| 100,000 requests a day | One alarm every 2 minutes (720), plus the app's checks every 10 seconds while it runs (8,640), plus MCP calls |
-| 100,000 rows written a day | Only tasks that changed, plus one row for the sync status per pass |
+| 100,000 requests a day | One alarm every 2 minutes (720), plus the app's checks (2,880 a day with only the tray, 8,640 with a window open), plus MCP calls |
+| 100,000 rows written a day | Only tasks that changed, plus a few rows per pass for the sync status and the revision |
+| 5,000,000 rows read a day | Two per check with no changes; the whole list (one row per task) only for each sync pass, op, and MCP call |
 | 50 subrequests per run | 3 searches, about one CI request per 15 open pull requests, and at most `MAX_INDIVIDUAL_CHECKS` (20) single fetches |
 | 10 ms CPU per run | See below |
 
 The CPU limit is the one to watch. Each pass parses GitHub's answers and
-updates the tasks, and a Durable Object that wakes up first reads every
-task. If passes fail with "exceeded CPU" in `npx wrangler@latest tail`,
-the Workers Paid plan ($5 a month) raises the limit to 30 seconds.
+updates the tasks, and first reads every task, since the Durable Object
+sleeps between requests. A check for changes reads no tasks. If passes
+fail with "exceeded CPU" in `npx wrangler@latest tail`, the Workers Paid
+plan ($5 a month) raises the limit to 30 seconds.
 
 ## Develop
 
