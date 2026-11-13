@@ -550,11 +550,13 @@ impl Core {
         }
     }
 
+    /// The current revision. It starts at 1, so that a copy sending
+    /// `since = 0` always means "I have nothing".
     fn rev(&self) -> Result<u64> {
         if let Some(r) = self.rev.get() {
             return Ok(r);
         }
-        let r = self.meta_u64("rev")?;
+        let r = self.meta_u64("rev")?.max(1);
         self.rev.set(Some(r));
         Ok(r)
     }
