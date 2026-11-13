@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  WRANGLER: wrangler@4.161.0
+
+jobs:
+  app:
+    name: App and shared crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # rust-toolchain.toml picks the version; rustup installs it.
+      - run: rustup component add clippy rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  worker:
+    name: Worker, and the app against it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup component add clippy rustfmt && rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            worker -> target
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Format and lint
+        working-directory: worker
+        run: |
+          cargo fmt --check
+          cargo clippy --target wasm32-unknown-unknown --locked -- -D warnings
+      - name: Start the Worker
+        working-directory: worker
+        run: |
+          # No real GitHub token: the sync fails, which the tests do not need.
+          printf 'API_TOKEN=ci-token\nGITHUB_TOKEN=none\n' > .dev.vars
+          npx -y "$WRANGLER" dev --port 8787 --ip 127.0.0.1 > wrangler.log 2>&1 &
+          for _ in $(seq 1 300); do
+            grep -q "Ready on" wrangler.log && exit 0
+            sleep 2
+          done
+          cat wrangler.log
+          exit 1
+      - name: Test the app's link against it
+        env:
+          LUNCH_TRAY_TEST_WORKER: http://127.0.0.1:8787
+          LUNCH_TRAY_REMOTE_TOKEN: ci-token
+        run: cargo test --locked -- --ignored --test-threads=1
+      - name: Worker log
+        if: always()
+        run: cat worker/wrangler.log || true
+
+  deploy:
+    name: Deploy the Worker
+    needs: [app, worker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Skip without a Cloudflare token
+        if: env.CLOUDFLARE_API_TOKEN == ''
+        run: echo "Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID to deploy from CI."
+      - uses: actions/checkout@v5
+        if: env.CLOUDFLARE_API_TOKEN != ''
+      - if: env.CLOUDFLARE_API_TOKEN != ''
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        with:
+          workspaces: worker -> target
+      - uses: actions/setup-node@v5
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        with:
+          node-version: 22
+      - name: Deploy
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        working-directory: worker
+        run: npx -y "$WRANGLER" deploy

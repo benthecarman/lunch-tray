@@ -127,3 +127,5 @@ time:
 LUNCH_TRAY_TEST_WORKER=http://127.0.0.1:8787 LUNCH_TRAY_REMOTE_TOKEN=dev-token \
   cargo test -- --ignored --test-threads=1
 ```
+
+CI does the same on every push; see `.github/workflows/ci.yml`.
