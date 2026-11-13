@@ -4,11 +4,10 @@
 mod activate;
 mod brand;
 mod config;
-mod mcp;
+mod http;
 mod remote;
 mod shared;
 mod style;
-mod sync;
 mod systemd;
 mod theme;
 mod tray;
@@ -22,10 +21,9 @@ use anyhow::Context;
 
 pub use lunch_tray_core::model;
 
-use crate::config::{Config, remote_cache_path, store_path};
+use crate::config::{Config, cache_path};
 use crate::model::Store;
 use crate::shared::{MainCmd, Notice, Shared, WindowMode};
-use crate::sync::SyncCmd;
 use crate::tray::TrayLink;
 
 const USAGE: &str = "\
@@ -33,9 +31,11 @@ lunch-tray [--hidden]
 
   --hidden   Start with only the tray icon; open the window from the tray.
   --popover  Start with the compact popover instead of the full window.
-  --upload   Send the local task file to the Worker set under [remote],
-             if the Worker has no tasks yet, then exit. With --replace,
-             overwrite the Worker's tasks.
+  --upload FILE
+             Send a task file, such as an old tasks.json or a copy of
+             remote-cache.json, to the Worker set under [remote], if the
+             Worker has no tasks yet, then exit. With --replace, overwrite
+             the Worker's tasks.
   --export-icons DIR
              Write launcher icons into DIR, a hicolor theme directory such
              as ~/.local/share/icons/hicolor, then exit.
@@ -73,12 +73,14 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let mut show_window = !args.iter().any(|a| a == "--hidden");
-    if args.iter().any(|a| a == "--upload") {
+    if let Some(i) = args.iter().position(|a| a == "--upload") {
+        let file = args.get(i + 1).context("--upload needs a task file")?;
         let cfg = Config::load()?;
         let remote = cfg
             .remote
             .context("--upload needs a [remote] section in the config")?;
-        let local = Store::load(&store_path()).context("load tasks")?;
+        let local =
+            Store::load(std::path::Path::new(file)).with_context(|| format!("load {file}"))?;
         let replace = args.iter().any(|a| a == "--replace");
         let n = remote::upload(&remote, &local, replace)?;
         println!("sent {n} tasks to {}", remote.url);
@@ -86,30 +88,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (main_tx, main_rx) = channel::<MainCmd>();
-    let (sync_tx, sync_rx) = channel::<SyncCmd>();
 
     let (cfg, config_error) = match Config::load() {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(format!("{e:#}"))),
     };
-    // With a Worker, keep a copy of its tasks for a start without network.
-    // The first time, the local tasks stand in until the Worker answers.
-    let store = match &cfg.remote {
-        Some(_) => {
-            let cache = remote_cache_path();
-            let seed = if cache.exists() {
-                cache.clone()
-            } else {
-                store_path()
-            };
-            Store::load(&seed).context("load tasks")?.with_path(cache)
-        }
-        None => {
-            let mut store = Store::load(&store_path()).context("load tasks")?;
-            store.mark_checks_stale();
-            store
-        }
-    };
+    // The last copy of the Worker's tasks, until it answers.
+    let store = Store::load(&cache_path()).context("load tasks")?;
     let (remote_tx, remote_rx) = channel::<remote::RemoteCmd>();
 
     let shared = Arc::new(Mutex::new(Shared {
@@ -124,7 +109,6 @@ fn main() -> anyhow::Result<()> {
         window: None,
         tray: TrayLink::new(),
         main_tx: main_tx.clone(),
-        sync_tx: sync_tx.clone(),
         remote: cfg.remote.as_ref().map(|_| remote_tx.clone()),
     }));
     if let Some(e) = config_error {
@@ -184,46 +168,29 @@ fn main() -> anyhow::Result<()> {
             })?;
     }
 
+    // The Worker syncs and serves MCP; this app shows its tasks.
     match &cfg.remote {
-        // The Worker syncs and serves MCP; this app shows its tasks.
-        Some(remote_cfg) => {
-            if cfg.mcp.is_some() {
-                log::warn!("[mcp] is not used with [remote]: the Worker serves MCP");
+        Some(remote_cfg) => match remote::Client::new(remote_cfg) {
+            Ok(client) => {
+                let polling = remote::Polling {
+                    open: Duration::from_secs(remote_cfg.poll_secs.max(2)),
+                    idle: Duration::from_secs(remote_cfg.idle_poll_secs.max(2)),
+                };
+                let shared = shared.clone();
+                log::info!("tasks live on {}", remote_cfg.url);
+                std::thread::Builder::new()
+                    .name("remote".into())
+                    .spawn(move || remote::run(client, polling, shared, remote_rx))?;
             }
-            match remote::Client::new(remote_cfg) {
-                Ok(client) => {
-                    let polling = remote::Polling {
-                        open: Duration::from_secs(remote_cfg.poll_secs.max(2)),
-                        idle: Duration::from_secs(remote_cfg.idle_poll_secs.max(2)),
-                    };
-                    let shared = shared.clone();
-                    log::info!("tasks live on {}", remote_cfg.url);
-                    std::thread::Builder::new()
-                        .name("remote".into())
-                        .spawn(move || remote::run(client, polling, shared, remote_rx))?;
-                }
-                Err(e) => shared
-                    .lock()
-                    .unwrap()
-                    .push_notice(Notice::error(format!("Worker: {e:#}"))),
-            }
-        }
-        None => {
-            let shared_for_sync = shared.clone();
-            let sync_cfg = cfg.clone();
-            std::thread::Builder::new()
-                .name("sync".into())
-                .spawn(move || sync::run_loop(sync_cfg, shared_for_sync, sync_rx))?;
-            if let Some(mcp_cfg) = &cfg.mcp
-                && let Err(e) = mcp::start(mcp_cfg, shared.clone())
-            {
-                log::warn!("mcp server not started: {e:#}");
-                shared
-                    .lock()
-                    .unwrap()
-                    .push_notice(Notice::error(format!("MCP server not started: {e:#}")));
-            }
-        }
+            Err(e) => shared
+                .lock()
+                .unwrap()
+                .push_notice(Notice::error(format!("Worker: {e:#}"))),
+        },
+        None => shared.lock().unwrap().push_notice(Notice::error(format!(
+            "No Worker set: add a [remote] section to {}",
+            crate::config::config_path().display()
+        ))),
     }
 
     systemd::notify("READY=1\n");
@@ -285,7 +252,6 @@ fn shutdown(shared: &shared::SharedRef) -> anyhow::Result<()> {
     systemd::notify("STOPPING=1\n");
     {
         let s = shared.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = s.sync_tx.send(SyncCmd::Quit);
         if let Some(tx) = &s.remote {
             let _ = tx.send(remote::RemoteCmd::Quit);
         }

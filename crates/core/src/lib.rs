@@ -1,6 +1,6 @@
 //! What the Lunch Tray app and its Cloudflare Worker share: the task model
-//! and its state machine, the operations that change it, the GitHub and
-//! Forgejo sync, and the MCP protocol handler.
+//! and its state machine, the operations that change it, the GitHub sync,
+//! and the MCP protocol handler.
 
 pub mod api;
 pub mod http;

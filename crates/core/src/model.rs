@@ -24,6 +24,7 @@ pub enum TaskState {
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     GitHub,
+    /// No longer synced; kept so older tasks still load.
     Forgejo,
 }
 
@@ -493,23 +494,14 @@ impl Store {
     /// Open pull requests on active tasks for `provider`/`host` whose check
     /// state should be fetched now: none saved, the item moved since the
     /// last fetch, the last result was still pending, or it is older than
-    /// `CHECKS_MAX_AGE`. Settled tasks also refresh after startup marks their
-    /// saved results stale; afterwards they are left alone until they come
-    /// back. Archived tasks are left alone. Most recently updated first.
+    /// `CHECKS_MAX_AGE`. Settled and archived tasks are left alone until
+    /// they come back. Most recently updated first.
     pub fn checks_due(&self, provider: Provider, host: &str, now: DateTime<Utc>) -> Vec<RemoteRef> {
         let mut due: Vec<RemoteRef> = self
             .data
             .tasks
             .iter()
-            .filter(|t| {
-                t.state == TaskState::Active
-                    || t.state == TaskState::Settled
-                        && t.remote().is_some_and(|r| {
-                            r.checks
-                                .as_ref()
-                                .is_some_and(|c| c.checked_at == DateTime::<Utc>::MIN_UTC)
-                        })
-            })
+            .filter(|t| t.state == TaskState::Active)
             .filter_map(|t| t.remote())
             .filter(|r| {
                 r.provider == provider
@@ -529,18 +521,6 @@ impl Store {
             .collect();
         due.sort_by_key(|r| std::cmp::Reverse(r.remote_updated_at));
         due
-    }
-
-    /// Make every saved check result due on the next sync. Called at
-    /// startup so a new build never shows results computed by an old one.
-    pub fn mark_checks_stale(&mut self) {
-        for t in &mut self.data.tasks {
-            if let Origin::Remote(r) = &mut t.origin
-                && let Some(c) = &mut r.checks
-            {
-                c.checked_at = DateTime::<Utc>::MIN_UTC;
-            }
-        }
     }
 
     /// Store a fetched check state. Returns true when it changed.
@@ -1544,31 +1524,6 @@ mod tests {
         s.settle(&id).unwrap();
         s.reopen(&id).unwrap();
         assert_eq!(s.checks_due(Provider::GitHub, "github.com", now).len(), 1);
-    }
-
-    #[test]
-    fn a_restart_makes_a_settled_check_result_due() {
-        let mut s = Store::in_memory();
-        let now = Utc::now();
-        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
-        let id = s.tasks()[0].id.clone();
-        s.set_checks(&id, checks(0, MergeState::Clean, now));
-        s.settle(&id).unwrap();
-        assert!(s.checks_due(Provider::GitHub, "github.com", now).is_empty());
-        s.mark_checks_stale();
-        assert_eq!(s.checks_due(Provider::GitHub, "github.com", now).len(), 1);
-        // The numbers themselves are kept for display until the fetch lands.
-        assert_eq!(
-            s.get(&id)
-                .unwrap()
-                .remote()
-                .unwrap()
-                .checks
-                .as_ref()
-                .unwrap()
-                .passed,
-            3
-        );
     }
 
     #[test]

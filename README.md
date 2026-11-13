@@ -1,9 +1,11 @@
 # Lunch Tray
 
 A system tray todo list for Ubuntu. It follows your pull requests and issues
-on GitHub and Forgejo, lets you add your own tasks, and lets you settle,
-archive, and delete them. Written in Rust with egui and a StatusNotifierItem
-tray icon.
+on GitHub, lets you add your own tasks, and lets you settle, archive, and
+delete them. The tasks live on a Cloudflare Worker, which syncs with GitHub
+and serves them to AI assistants over MCP, so both stay online while your
+computer is off. The app is written in Rust with egui and a
+StatusNotifierItem tray icon.
 
 ![The full window in light mode](assets/screenshot-light.png)
 ![The popover in dark mode](assets/screenshot-popover-dark.png)
@@ -14,18 +16,22 @@ tray icon.
   tasks. Right click shows a short native menu: open, add, sync, quit. A badge
   on the icon shows new activity or a sync error.
 - Full window with Pinned, Active, Settled, and Archived sections.
-- GitHub and Forgejo (or Gitea) sync. New open items become tasks. Closed or
-  merged items settle on their own. New activity on a settled item wakes it.
+- GitHub sync, run by the Worker every two minutes. New open items become
+  tasks. Closed or merged items settle on their own. New activity on a
+  settled item wakes it.
 - CI results and merge state on open pull requests: passed over total
   checks, and a warning when the branch conflicts with its base. Active
   tasks are polled when the result is missing, stale, still running, or
-  the pull request moved. Settled tasks refresh once at startup, then keep
-  their last badge until they come back. Archived tasks keep their last
-  badge until they come back.
+  the pull request moved. Settled and archived tasks keep their last badge
+  until they come back.
 - Light on GitHub's rate limit: searches send the last ETag, so an
   unchanged answer costs nothing; the quota headers are read on every
   answer and optional work waits when the last tenth is left; a
-  rate-limit answer pauses that host until the time GitHub gives.
+  rate-limit answer pauses the sync until the time GitHub gives.
+- Changes show at once: the Worker pushes them to the app over a WebSocket.
+  The app keeps a copy of the tasks for a start without network.
+- An MCP server on the Worker, so AI assistants can read and change the
+  tasks.
 - Manual tasks with notes and a link.
 - The window is a tray: a mint-grey melamine surface with a recessed
   compartment per section, and mustard for the few things that need
@@ -36,8 +42,12 @@ tray icon.
 
 ## Build and install
 
-Requires Rust 1.95 or newer (`rust-toolchain.toml` pins 1.96.1). No system
-development headers are needed.
+Lunch Tray has two parts: the Worker, which keeps the tasks, and this app,
+which shows them. Set up the Worker first; see
+[worker/README.md](worker/README.md). It fits in the Workers Free plan.
+
+The app requires Rust 1.95 or newer (`rust-toolchain.toml` pins 1.96.1). No
+system development headers are needed.
 
 ```sh
 git clone https://github.com/benthecarman/lunch-tray
@@ -59,14 +69,14 @@ Useful afterwards:
 ```sh
 systemctl --user status lunch-tray     # state and recent log
 journalctl --user -u lunch-tray -f     # follow the log
-systemctl --user reload lunch-tray     # sync now (sends SIGHUP)
+systemctl --user reload lunch-tray     # ask the Worker to sync now (sends SIGHUP)
 systemctl --user restart lunch-tray    # pick up config changes
 ```
 
-The unit is `Type=notify`: the app reports ready once its tray and sync
-threads are up, stops cleanly on SIGTERM, and is restarted on failure. If it
-starts before the shell's tray host, it waits and registers when the host
-appears.
+The unit is `Type=notify`: the app reports ready once its tray and its link
+to the Worker are up, stops cleanly on SIGTERM, and is restarted on failure.
+If it starts before the shell's tray host, it waits and registers when the
+host appears.
 
 For an entry in the app grid that opens the full window, with its icon:
 
@@ -93,8 +103,9 @@ which does land on top.
 
 Left-click the tray icon to toggle the popover. It closes when the pointer
 has been inside it and focus moves elsewhere, on Escape, or with its close
-button. The expand button in its header opens the full window. Closing any window keeps the app in the tray. Quit from
-the tray menu or the window menu.
+button. The expand button in its header opens the full window. Closing any
+window keeps the app in the tray. Quit from the tray menu or the window
+menu.
 
 Wayland does not let an app choose where its windows appear, so GNOME places
 the popover like any new window, usually centered. It can be dragged by its
@@ -102,109 +113,49 @@ header.
 
 ## Configuration
 
-The first run writes `~/.config/lunch-tray/config.toml`. With no changes, it
-watches GitHub through the token from `gh auth token`.
+The first run writes `~/.config/lunch-tray/config.toml`. Point it at your
+Worker:
 
 ```toml
-poll_interval_secs = 120
-on_close = "settle"   # or "archive": closed and merged items skip Settled
-checks = true         # CI results and merge state on open pull requests
-
-[[github]]
-# token = "ghp_..."            # or token_env, GITHUB_TOKEN, or `gh auth token`
-# api_url = "https://ghe.example.com/api/v3"
-queries = [
-  "is:open is:pr author:@me archived:false",
-  "is:open is:pr review-requested:@me archived:false",
-  "is:open assignee:@me archived:false",
-]
-
-[[forgejo]]
-url = "https://codeberg.org"
-token_env = "FORGEJO_TOKEN"
-queries = [
-  "type=pulls&created=true",
-  "type=pulls&review_requested=true",
-  "type=issues&assigned=true",
-]
+[remote]
+url = "https://lunch-tray.<your-subdomain>.workers.dev"
+token = "..."    # the Worker's API_TOKEN, or token_env
 ```
 
-GitHub queries use the search syntax. Forgejo queries are query strings for
-`/api/v1/repos/issues/search`.
+The sync settings live on the Worker, under `[vars]` in
+`worker/wrangler.toml`: the poll interval, where closed items go
+(`ON_CLOSE`), CI checks, the GitHub searches, and repositories to ignore
+(`GITHUB_EXCLUDE`, as `owner/repo` or `owner/*`). Items from an ignored
+repository are never added, and tasks already tracked from one are archived
+on the next sync.
 
-To ignore repositories, add `exclude` to an account with `owner/repo` or
-`owner/*` patterns. Their items are never added, and any tasks already
-tracked from them are archived on the next sync:
-
-```toml
-[[github]]
-exclude = ["someorg/noisy-repo", "archived-org/*"]
-```
-
-For a Forgejo token: your avatar, Settings, Applications, Generate token,
-with read access to issues, repositories, and your user. Without a token the
-search ignores the `created`, `assigned`, and `review_requested` filters and
-returns the whole instance, so the app refuses to sync a Forgejo account
-without one.
-
-Some self-hosted forges sit behind a proof-of-work bot gate that answers API
-calls with an HTML challenge page. Lunch Tray solves it the way a browser
-would and keeps the cookie for the session.
-
-Tasks are stored in `~/.local/share/lunch-tray/tasks.json`.
+The app keeps its copy of the tasks, and its own theme and "show archived"
+settings, in `~/.local/share/lunch-tray/remote-cache.json`. To load a task
+file into an empty Worker, such as that copy or a `tasks.json` from an older
+version, run `lunch-tray --upload FILE`.
 
 ## MCP server
 
-Lunch Tray can give AI assistants its task list as MCP tools: list, get,
-add, update, move, and delete tasks, mark them as read, sync now, and show
-the status. It is off by default. To turn it on, add an `[mcp]` section to
-`config.toml` and restart the app:
-
-```toml
-[mcp]
-listen = "127.0.0.1:7428"   # the default
-token = "a-long-random-string"   # or token_env; clients send it as a Bearer token
-# allowed_origins = []      # browser origins to accept; others get 403
-```
-
-The endpoint is `http://<listen>/mcp`. It uses the Streamable HTTP
-transport of MCP revision 2026-07-28: stateless, with `server/discover`
-and no `initialize` handshake. Clients on the 2025 revisions also work.
-Their `initialize` gets an answer, and the server never issues a session
-id. Each response is a single JSON object; nothing streams.
-
-To reach it from other devices on your tailnet, keep it on localhost and
-let Tailscale serve it over HTTPS:
+The Worker gives AI assistants the task list as MCP tools: list, get, add,
+update, move, and delete tasks, mark them as read, sync now, and show the
+status. The endpoint is `https://lunch-tray.<your-subdomain>.workers.dev/mcp`,
+behind the same `API_TOKEN`:
 
 ```sh
-tailscale serve --bg 7428
+claude mcp add --transport http lunch-tray https://lunch-tray.<your-subdomain>.workers.dev/mcp \
+  --header "Authorization: Bearer <API_TOKEN>"
 ```
 
-The URL is then `https://<machine>.<tailnet>.ts.net/mcp`. As an
-alternative, set `listen` to the machine's tailnet address (see
-`tailscale ip -4`). If that address is not up yet when the app starts,
-the server tries again every ten seconds.
-
-Set a token. Without one, anyone who can reach the port can read and
-change your tasks. To add the server to Claude Code:
-
-```sh
-claude mcp add --transport http lunch-tray https://<machine>.<tailnet>.ts.net/mcp \
-  --header "Authorization: Bearer a-long-random-string"
-```
-
-## Run it on Cloudflare
-
-The app can also leave the tasks to a Cloudflare Worker. The Worker syncs
-with GitHub on a timer and serves the MCP tools at a public URL behind a
-token, so both stay online while your computer is off. The app then shows
-the Worker's tasks and sends your changes to it. It fits in the Workers
-Free plan. Forgejo stays with the app. See [worker/README.md](worker/README.md).
+It uses the Streamable HTTP transport of MCP revision 2026-07-28:
+stateless, with `server/discover` and no `initialize` handshake. Clients on
+the 2025 revisions also work. Their `initialize` gets an answer, and the
+server never issues a session id. Each response is a single JSON object;
+nothing streams.
 
 ## The state machine
 
 A task has one `state` field: `active`, `settled`, or `archived`. Deleted
-tasks are removed from the file. A `pinned` flag puts an active task in the
+tasks are removed. A `pinned` flag puts an active task in the
 Pinned section. Every section sorts by last activity, newest first: the
 remote item's update time, or the task's own for manual ones.
 
@@ -238,7 +189,7 @@ Sync applies these rules to tracked items:
 
 - open, not tracked: new Active task
 - open to closed or merged: an Active task settles, or goes to Archived
-  when `on_close = "archive"` (a Settled task moves too)
+  when the Worker has `ON_CLOSE = "archive"` (a Settled task moves too)
 - closed to open: a Settled or Archived task reopens
 - open but no longer in any of your queries, for example after you submit
   a review: an Active task settles. Pinned tasks stay.
@@ -271,6 +222,7 @@ LUNCH_TRAY_SCREENSHOT=/tmp/shot.png cargo run   # saves the window and quits
 
 The task model, the sync, and the MCP handler live in `crates/core`, shared
 by the app and the Worker in `worker/`, which builds on its own for wasm.
+See [worker/README.md](worker/README.md) to run the Worker locally.
 
 ## License
 

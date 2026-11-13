@@ -10,9 +10,6 @@ includes. The Worker code is Rust, built to wasm with `workers-rs`. It
 shares the task model, the sync, and the MCP handler with the app through
 `crates/core`.
 
-Forgejo is not synced from the Worker. Use the app without `[remote]` for
-that.
-
 ## Set up
 
 You need a Cloudflare account, Node.js for `wrangler`, and the
@@ -26,8 +23,15 @@ npx wrangler@latest login
 
 Set two secrets. `API_TOKEN` is the bearer token for everything the Worker
 serves; make it long and random. `GITHUB_TOKEN` must be able to read your
-pull requests and issues. A fine-grained token with read access is the
-safest choice. `gh auth token` also works, but that token can do much more.
+pull requests and issues:
+
+- If every repository you follow is public, or they all belong to one
+  owner, a fine-grained token with read-only access is the safest choice.
+- A fine-grained token covers one owner. For private repositories under
+  several owners, use a [classic token with only `repo` and
+  `read:org`](https://github.com/settings/tokens/new?scopes=repo,read:org&description=lunch-tray%20worker).
+- `gh auth token` also works, but that token can do much more, and
+  `gh auth logout` revokes it.
 
 ```sh
 openssl rand -hex 32 | tee /dev/stderr | npx wrangler@latest secret put API_TOKEN
@@ -54,21 +58,21 @@ url = "https://lunch-tray.<your-subdomain>.workers.dev"
 token = "<API_TOKEN>"
 ```
 
-Send your current tasks to the Worker once, then restart the app:
+To start from tasks you already have, such as a `tasks.json` from an older
+version, load them into the new Worker, then restart the app:
 
 ```sh
-lunch-tray --upload
+lunch-tray --upload ~/.local/share/lunch-tray/tasks.json
 systemctl --user restart lunch-tray
 ```
 
-`--upload` only fills an empty Worker. `--upload --replace` overwrites it.
+`--upload` only fills an empty Worker. `--upload FILE --replace` overwrites
+it.
 
-With `[remote]`, the app no longer syncs on its own. It also ignores
-`[[github]]`, `[[forgejo]]`, and `[mcp]`. It sends a change the moment you
-make it, and keeps a copy of the tasks in
-`~/.local/share/lunch-tray/remote-cache.json`. When the Worker cannot be
-reached, the tray shows the error badge and the window shows the last tasks
-it had.
+The app sends a change the moment you make it, and keeps a copy of the
+tasks in `~/.local/share/lunch-tray/remote-cache.json`. When the Worker
+cannot be reached, the tray shows the error badge and the window shows the
+last tasks it had.
 
 The app downloads the whole list once at start, then opens a WebSocket.
 The Worker pushes each change down it the moment it happens: only the tasks
@@ -116,9 +120,10 @@ npx wrangler@latest dev
 ```
 
 `wrangler dev` needs a recent wrangler: older ones lack runtime APIs that
-`workers-rs` 0.9 calls. To test the app's link against it:
+`workers-rs` 0.9 calls. To test the app's link against it, one test at a
+time:
 
 ```sh
 LUNCH_TRAY_TEST_WORKER=http://127.0.0.1:8787 LUNCH_TRAY_REMOTE_TOKEN=dev-token \
-  cargo test -- --ignored
+  cargo test -- --ignored --test-threads=1
 ```

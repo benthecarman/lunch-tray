@@ -1,4 +1,4 @@
-//! Remote providers (GitHub, Forgejo) and one sync pass over them. The
+//! The GitHub sync: one pass over the configured searches. The
 //! caller decides when to run a pass and where the store lives, through
 //! `SyncHost`.
 
@@ -22,8 +22,6 @@ const MAX_PAGES: usize = 5;
 /// Pull requests per GraphQL request. GitHub gives a query about ten
 /// seconds; bigger batches across many repositories time out with a 502.
 const GRAPHQL_BATCH: usize = 15;
-/// Forgejo needs two calls per pull request; cap each poll.
-const FORGEJO_CHECKS_PER_POLL: usize = 20;
 
 #[async_trait(?Send)]
 pub trait Forge {
@@ -68,12 +66,9 @@ enum CheckOutcome {
     Skipped,
 }
 
-/// One HTTP client per account. Error statuses come back as responses so
-/// the proof-of-work gate can be read before deciding what failed.
+/// One HTTP client per account, keeping GitHub's ETags and rate limits.
 pub struct Http {
     transport: Box<dyn Transport>,
-    /// Cookie earned from a proof-of-work gate, if the host has one.
-    gate_cookie: Mutex<Option<String>>,
     /// ETag and body of the last answer per GET URL. A matching `304`
     /// costs nothing against GitHub's rate limit.
     etags: Mutex<HashMap<String, (String, String)>>,
@@ -112,7 +107,6 @@ impl Http {
     pub fn new(transport: Box<dyn Transport>) -> Self {
         Http {
             transport,
-            gate_cookie: Mutex::new(None),
             etags: Mutex::new(HashMap::new()),
             quotas: Mutex::new(HashMap::new()),
             paused_until: Mutex::new(None),
@@ -147,9 +141,7 @@ impl Http {
             .any(|q| q.reset > now && q.remaining * 10 < q.limit)
     }
 
-    /// GET `url` with `headers` and decode JSON. A 403 carrying a
-    /// proof-of-work challenge page is solved once, then the request is
-    /// retried with the earned cookie.
+    /// GET `url` with `headers` and decode JSON.
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         url: &str,
@@ -181,216 +173,93 @@ impl Http {
             );
         }
         let method = if body.is_some() { "POST" } else { "GET" };
-        for attempt in 0..2 {
-            let cookie = self
-                .gate_cookie
+        let cached = if body.is_none() {
+            self.etags
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let cached = if body.is_none() {
-                self.etags
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(url)
-                    .cloned()
-            } else {
-                None
+                .get(url)
+                .cloned()
+        } else {
+            None
+        };
+        let mut req_headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        req_headers.push(("User-Agent".into(), USER_AGENT.into()));
+        if let Some((etag, _)) = &cached {
+            req_headers.push(("If-None-Match".into(), etag.clone()));
+        }
+        if body.is_some() {
+            req_headers.push(("Content-Type".into(), "application/json".into()));
+        }
+        let resp = self
+            .transport
+            .send(Request {
+                method,
+                url: url.to_string(),
+                headers: req_headers,
+                body: body.map(|b| b.to_string()),
+            })
+            .await
+            .with_context(|| format!("{method} {url}"))?;
+        let status = resp.status;
+        if let Some((resource, quota)) = parse_quota(&resp) {
+            log::trace!("{resource} quota: {}/{}", quota.remaining, quota.limit);
+            self.quotas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(resource, quota);
+        }
+        if status == 304
+            && let Some((_, text)) = cached
+        {
+            log::debug!("unchanged: {url}");
+            return serde_json::from_str::<T>(&text).with_context(|| format!("decode {url}"));
+        }
+        if status == 403 || status == 429 {
+            // GitHub says 403 for its primary limit and 403 or 429 for
+            // the secondary one, with a Retry-After. Stop until then.
+            let retry_after = resp
+                .header("retry-after")
+                .and_then(|v| v.parse::<i64>().ok());
+            let exhausted = parse_quota(&resp)
+                .filter(|(_, q)| q.remaining == 0)
+                .map(|(_, q)| q.reset);
+            let message = serde_json::from_str::<serde_json::Value>(&resp.body)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+                .unwrap_or_default();
+            let until = match (retry_after, exhausted) {
+                (Some(secs), _) => Some(Utc::now() + chrono::Duration::seconds(secs.max(1))),
+                (None, Some(reset)) => Some(reset),
+                (None, None) if message.to_lowercase().contains("rate limit") => {
+                    Some(Utc::now() + chrono::Duration::seconds(60))
+                }
+                _ => None,
             };
-            let mut req_headers: Vec<(String, String)> = headers
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.clone()))
-                .collect();
-            req_headers.push(("User-Agent".into(), USER_AGENT.into()));
-            if let Some(c) = &cookie {
-                req_headers.push(("Cookie".into(), c.clone()));
+            if let Some(until) = until {
+                log::warn!("{method} {url}: {status}, backing off until {until}: {message}");
+                self.pause_until(until);
+                bail!(
+                    "rate limited until {}",
+                    until.with_timezone(&chrono::Local).format("%H:%M")
+                );
             }
-            if let Some((etag, _)) = &cached {
-                req_headers.push(("If-None-Match".into(), etag.clone()));
-            }
-            if body.is_some() {
-                req_headers.push(("Content-Type".into(), "application/json".into()));
-            }
-            let resp = self
-                .transport
-                .send(Request {
-                    method,
-                    url: url.to_string(),
-                    headers: req_headers,
-                    body: body.map(|b| b.to_string()),
-                })
-                .await
-                .with_context(|| format!("{method} {url}"))?;
-            let status = resp.status;
-            if let Some((resource, quota)) = parse_quota(&resp) {
-                log::trace!("{resource} quota: {}/{}", quota.remaining, quota.limit);
-                self.quotas
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(resource, quota);
-            }
-            if status == 304
-                && let Some((_, text)) = cached
-            {
-                log::debug!("unchanged: {url}");
-                return serde_json::from_str::<T>(&text).with_context(|| format!("decode {url}"));
-            }
-            let html = resp
-                .header("content-type")
-                .is_some_and(|ct| ct.contains("text/html"));
-            if status == 403 && html && attempt == 0 {
-                if let Some(challenge) = pow::parse(&resp.body) {
-                    let cookie = pow::solve(&challenge);
-                    log::info!(
-                        "solved the proof-of-work gate for {url} at difficulty {}",
-                        challenge.difficulty
-                    );
-                    *self.gate_cookie.lock().unwrap_or_else(|e| e.into_inner()) = Some(cookie);
-                    continue;
-                }
-                bail!("GET {url}: http status 403");
-            }
-            if status == 403 || status == 429 {
-                // GitHub says 403 for its primary limit and 403 or 429 for
-                // the secondary one, with a Retry-After. Stop until then.
-                let retry_after = resp
-                    .header("retry-after")
-                    .and_then(|v| v.parse::<i64>().ok());
-                let exhausted = parse_quota(&resp)
-                    .filter(|(_, q)| q.remaining == 0)
-                    .map(|(_, q)| q.reset);
-                let message = serde_json::from_str::<serde_json::Value>(&resp.body)
-                    .ok()
-                    .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-                    .unwrap_or_default();
-                let until = match (retry_after, exhausted) {
-                    (Some(secs), _) => Some(Utc::now() + chrono::Duration::seconds(secs.max(1))),
-                    (None, Some(reset)) => Some(reset),
-                    (None, None) if message.to_lowercase().contains("rate limit") => {
-                        Some(Utc::now() + chrono::Duration::seconds(60))
-                    }
-                    _ => None,
-                };
-                if let Some(until) = until {
-                    log::warn!("{method} {url}: {status}, backing off until {until}: {message}");
-                    self.pause_until(until);
-                    bail!(
-                        "rate limited until {}",
-                        until.with_timezone(&chrono::Local).format("%H:%M")
-                    );
-                }
-                return Err(StatusError(status))
-                    .with_context(|| format!("{method} {url}: {message}"));
-            }
-            if status >= 400 {
-                return Err(StatusError(status)).with_context(|| format!("{method} {url}"));
-            }
-            if body.is_none()
-                && let Some(etag) = resp.header("etag")
-            {
-                self.etags
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(url.to_string(), (etag.to_string(), resp.body.clone()));
-            }
-            return serde_json::from_str::<T>(&resp.body).with_context(|| format!("decode {url}"));
+            return Err(StatusError(status)).with_context(|| format!("{method} {url}: {message}"));
         }
-        bail!("GET {url}: the proof-of-work gate did not accept the answer")
-    }
-}
-
-/// Some self-hosted forges sit behind a bot gate that answers with an HTML
-/// page asking the client for a SHA-1 proof of work: find a nonce so that
-/// `sha1(challenge + ":" + nonce)` starts with `difficulty` zero bits, then
-/// present `challenge:nonce` in a cookie. This does what a browser would.
-mod pow {
-    pub struct Challenge {
-        pub difficulty: u32,
-        pub challenge: String,
-        pub cookie_name: String,
-    }
-
-    /// Value of a `const NAME = ...;` line in the page's script.
-    fn js_const<'a>(html: &'a str, name: &str) -> Option<&'a str> {
-        let key = format!("const {name}");
-        let start = html.find(&key)? + key.len();
-        let rest = &html[start..];
-        let eq = rest.find('=')?;
-        let rest = &rest[eq + 1..];
-        let end = rest.find(';')?;
-        Some(rest[..end].trim().trim_matches('"'))
-    }
-
-    pub fn parse(html: &str) -> Option<Challenge> {
-        let difficulty = js_const(html, "difficulty")?.parse().ok()?;
-        let challenge = js_const(html, "challenge")?.to_string();
-        let cookie_name = js_const(html, "tokenCookie")?.to_string();
-        if challenge.is_empty() || cookie_name.is_empty() || difficulty > 40 {
-            return None;
+        if status >= 400 {
+            return Err(StatusError(status)).with_context(|| format!("{method} {url}"));
         }
-        Some(Challenge {
-            difficulty,
-            challenge,
-            cookie_name,
-        })
-    }
-
-    fn leading_zero_bits(bytes: &[u8]) -> u32 {
-        let mut n = 0;
-        for b in bytes {
-            if *b == 0 {
-                n += 8;
-            } else {
-                n += b.leading_zeros();
-                break;
-            }
+        if body.is_none()
+            && let Some(etag) = resp.header("etag")
+        {
+            self.etags
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(url.to_string(), (etag.to_string(), resp.body.clone()));
         }
-        n
-    }
-
-    /// Returns the `Cookie` header value.
-    pub fn solve(c: &Challenge) -> String {
-        let mut nonce: u64 = 0;
-        loop {
-            let data = format!("{}:{nonce}", c.challenge);
-            let digest = sha1_smol::Sha1::from(data.as_bytes()).digest().bytes();
-            if leading_zero_bits(&digest) >= c.difficulty {
-                return format!("{}={}", c.cookie_name, super::urlencode(&data));
-            }
-            nonce += 1;
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        const PAGE: &str = r#"<script>(function(){
-    const difficulty   = 8;
-    const challenge    = "XY811qPJFlefxx+HbqLBb3zuGkI=";
-    const tokenCookie  = "poW_token_v4";
-    const includeUI    = true;
-})();</script>"#;
-
-        #[test]
-        fn parses_and_solves_a_challenge_page() {
-            let c = parse(PAGE).unwrap();
-            assert_eq!(c.difficulty, 8);
-            assert_eq!(c.cookie_name, "poW_token_v4");
-            let cookie = solve(&c);
-            let (name, value) = cookie.split_once('=').unwrap();
-            assert_eq!(name, "poW_token_v4");
-            assert!(value.starts_with("XY811qPJFlefxx%2BHbqLBb3zuGkI%3D%3A"));
-            let nonce: u64 = value.rsplit("%3A").next().unwrap().parse().unwrap();
-            let digest = sha1_smol::Sha1::from(format!("{}:{nonce}", c.challenge).as_bytes())
-                .digest()
-                .bytes();
-            assert!(leading_zero_bits(&digest) >= 8);
-        }
-
-        #[test]
-        fn ignores_pages_without_a_challenge() {
-            assert!(parse("<html>403 Forbidden</html>").is_none());
-        }
+        serde_json::from_str::<T>(&resp.body).with_context(|| format!("decode {url}"))
     }
 }
 
@@ -1021,270 +890,6 @@ impl GqlPr {
     }
 }
 
-// ----- Forgejo / Gitea ------------------------------------------------------
-
-pub struct Forgejo {
-    base: String,
-    host: String,
-    token: String,
-    queries: Vec<String>,
-    exclude: Vec<String>,
-    http: Http,
-}
-
-impl Forgejo {
-    pub fn new(
-        url: &str,
-        token: String,
-        queries: Vec<String>,
-        exclude: Vec<String>,
-        transport: Box<dyn Transport>,
-    ) -> Self {
-        Forgejo {
-            base: url.trim_end_matches('/').to_string(),
-            host: forgejo_host(url),
-            token,
-            queries,
-            exclude,
-            http: Http::new(transport),
-        }
-    }
-
-    async fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        self.http
-            .get_json(
-                url,
-                &[
-                    ("Authorization", format!("token {}", self.token)),
-                    ("Accept", "application/json".to_string()),
-                ],
-            )
-            .await
-    }
-
-    fn convert(&self, it: FjIssue) -> RemoteItem {
-        let (owner, repo) = match &it.repository {
-            Some(r) => (r.owner.clone(), r.name.clone()),
-            None => {
-                // Fall back to the URL: https://host/owner/repo/(pulls|issues)/n
-                let mut parts = it.html_url.rsplit('/');
-                let _n = parts.next();
-                let _kind = parts.next();
-                let repo = parts.next().unwrap_or_default().to_string();
-                let owner = parts.next().unwrap_or_default().to_string();
-                (owner, repo)
-            }
-        };
-        let (kind, state) = match &it.pull_request {
-            Some(pr) => (
-                RemoteKind::PullRequest,
-                if it.state == "open" {
-                    RemoteState::Open
-                } else if pr.merged {
-                    RemoteState::Merged
-                } else {
-                    RemoteState::Closed
-                },
-            ),
-            None => (
-                RemoteKind::Issue,
-                if it.state == "open" {
-                    RemoteState::Open
-                } else {
-                    RemoteState::Closed
-                },
-            ),
-        };
-        let draft = it.pull_request.as_ref().is_some_and(|pr| pr.draft);
-        RemoteItem {
-            r: RemoteRef {
-                provider: Provider::Forgejo,
-                host: self.host.clone(),
-                owner,
-                repo,
-                number: it.number,
-                kind,
-                url: it.html_url,
-                author: it.user.map(|u| u.login).unwrap_or_default(),
-                state,
-                draft,
-                remote_updated_at: parse_time(&it.updated_at),
-                in_queries: true,
-                query_misses: 0,
-                checks: None,
-            },
-            title: it.title,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct FjIssue {
-    number: u64,
-    title: String,
-    html_url: String,
-    state: String,
-    updated_at: String,
-    repository: Option<FjRepo>,
-    user: Option<FjUser>,
-    pull_request: Option<FjPullRef>,
-}
-
-#[derive(Deserialize)]
-struct FjRepo {
-    owner: String,
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct FjUser {
-    login: String,
-}
-
-#[derive(Deserialize)]
-struct FjPull {
-    mergeable: Option<bool>,
-    #[serde(default)]
-    draft: bool,
-    head: FjHead,
-}
-
-#[derive(Deserialize)]
-struct FjHead {
-    sha: String,
-}
-
-#[derive(Deserialize)]
-struct FjCombinedStatus {
-    /// Forgejo sends `null` rather than an empty list when there are none.
-    #[serde(default)]
-    statuses: Option<Vec<FjStatus>>,
-}
-
-#[derive(Deserialize)]
-struct FjStatus {
-    status: String,
-}
-
-#[derive(Deserialize)]
-struct FjPullRef {
-    #[serde(default)]
-    merged: bool,
-    #[serde(default)]
-    draft: bool,
-}
-
-/// Host of a Forgejo base URL.
-pub fn forgejo_host(url: &str) -> String {
-    let trimmed = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    trimmed.split('/').next().unwrap_or(trimmed).to_string()
-}
-
-#[async_trait(?Send)]
-impl Forge for Forgejo {
-    fn provider(&self) -> Provider {
-        Provider::Forgejo
-    }
-
-    fn host(&self) -> String {
-        self.host.clone()
-    }
-
-    fn exclude(&self) -> &[String] {
-        &self.exclude
-    }
-
-    /// Two calls per pull request: the PR for its head and mergeability,
-    /// then the combined status of that commit.
-    async fn fetch_checks(&self, prs: &[RemoteRef]) -> Result<Vec<(String, Checks)>> {
-        let mut out = Vec::new();
-        for r in prs.iter().take(FORGEJO_CHECKS_PER_POLL) {
-            let pr_url = format!(
-                "{}/api/v1/repos/{}/{}/pulls/{}",
-                self.base, r.owner, r.repo, r.number
-            );
-            let pr: FjPull = match self.get(&pr_url).await {
-                Ok(pr) => pr,
-                Err(e) => {
-                    log::warn!("checks for {}: {e:#}", r.label());
-                    continue;
-                }
-            };
-            let status_url = format!(
-                "{}/api/v1/repos/{}/{}/commits/{}/status",
-                self.base, r.owner, r.repo, pr.head.sha
-            );
-            let combined: FjCombinedStatus = match self.get(&status_url).await {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("status for {}: {e:#}", r.label());
-                    continue;
-                }
-            };
-            let statuses = combined.statuses.unwrap_or_default();
-            let (passed, failed, pending, total) =
-                tally(statuses.iter().map(|st| match st.status.as_str() {
-                    // As Paseo maps them. Forgejo blocks a merge on
-                    // "warning", so it is not a pass.
-                    "success" => CheckOutcome::Passed,
-                    "failure" | "error" | "warning" => CheckOutcome::Failed,
-                    "skipped" => CheckOutcome::Skipped,
-                    _ => CheckOutcome::Pending,
-                }));
-            let merge = match (pr.mergeable, pr.draft) {
-                (Some(true), _) => MergeState::Clean,
-                // Forgejo calls drafts unmergeable without saying whether
-                // they conflict; GitHub treats drafts as clean, so match it.
-                (Some(false), true) => MergeState::Clean,
-                (Some(false), false) => MergeState::Conflicting,
-                (None, _) => MergeState::Unknown,
-            };
-            out.push((
-                r.key(),
-                Checks {
-                    passed,
-                    failed,
-                    pending,
-                    total,
-                    merge,
-                    head_sha: pr.head.sha,
-                    checked_at: Utc::now(),
-                },
-            ));
-        }
-        Ok(out)
-    }
-
-    async fn fetch_open(&self) -> Result<Vec<RemoteItem>> {
-        let mut out = Vec::new();
-        for q in &self.queries {
-            for page in 1..=MAX_PAGES {
-                let url = format!(
-                    "{}/api/v1/repos/issues/search?state=open&limit=50&page={}&{}",
-                    self.base, page, q
-                );
-                let res: Vec<FjIssue> = self.get(&url).await?;
-                let n = res.len();
-                out.extend(res.into_iter().map(|i| self.convert(i)));
-                // Servers may cap `limit` below 50, so only an empty page ends
-                // the walk.
-                if n == 0 {
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    async fn fetch_one(&self, owner: &str, repo: &str, number: u64) -> Result<RemoteItem> {
-        let url = format!("{}/api/v1/repos/{owner}/{repo}/issues/{number}", self.base);
-        let it: FjIssue = self.get(&url).await?;
-        Ok(self.convert(it))
-    }
-}
-
 /// How the last passes went, for the window, the tray, and the MCP tools.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncStatus {
@@ -1355,19 +960,6 @@ fn is_gone(e: &anyhow::Error) -> bool {
         e.downcast_ref::<StatusError>(),
         Some(StatusError(404 | 410))
     )
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// One pass over every forge. Returns the errors, one line per forge that
@@ -1614,14 +1206,6 @@ mod tests {
         assert_eq!((checks.passed, checks.total), (1, 1));
         assert_eq!(host.notices.borrow().as_slice(), ["New: o/r #5"]);
         assert!(*host.saves.borrow() >= 2);
-    }
-
-    #[test]
-    fn urlencode_keeps_search_syntax_readable() {
-        assert_eq!(
-            urlencode("is:open is:pr author:@me"),
-            "is%3Aopen%20is%3Apr%20author%3A%40me"
-        );
     }
 
     #[test]
@@ -1878,27 +1462,5 @@ mod tests {
         assert_eq!(gh.graphql_url(), "https://api.github.com/graphql");
         gh.api_url = "https://ghe.example.com/api/v3".into();
         assert_eq!(gh.graphql_url(), "https://ghe.example.com/api/graphql");
-    }
-
-    #[test]
-    fn forgejo_item_converts() {
-        let fj = Forgejo {
-            base: "https://codeberg.org".into(),
-            host: "codeberg.org".into(),
-            token: String::new(),
-            queries: vec![],
-            exclude: vec![],
-            http: Http::new(Box::new(NoNet)),
-        };
-        let json = r#"{"number": 3, "title": "Bug", "html_url": "https://codeberg.org/o/r/issues/3",
-            "state": "open", "updated_at": "2026-02-03T04:05:06Z",
-            "repository": {"owner": "o", "name": "r", "full_name": "o/r"},
-            "user": {"login": "ben"}, "pull_request": null}"#;
-        let it: FjIssue = serde_json::from_str(json).unwrap();
-        let item = fj.convert(it);
-        assert!(!item.r.draft);
-        assert_eq!(item.r.kind, RemoteKind::Issue);
-        assert_eq!(item.r.state, RemoteState::Open);
-        assert_eq!(item.r.project(), "o/r");
     }
 }

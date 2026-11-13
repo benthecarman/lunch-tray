@@ -48,7 +48,7 @@ const UNSUPPORTED_VERSION: i64 = -32022;
 
 const INSTRUCTIONS: &str = "\
 Lunch Tray is a todo list that follows the user's pull requests and issues \
-on GitHub and Forgejo, plus tasks the user adds by hand. Each task is in one \
+on GitHub, plus tasks the user adds by hand. Each task is in one \
 section: pinned, active, settled (done for now), or archived. Remote tasks \
 come and go with sync: a new open item becomes active, a closed or merged \
 one settles, and new activity on a settled or archived item brings it back \
@@ -768,7 +768,7 @@ fn tool_list() -> Value {
         {
             "name": "sync_now",
             "title": "Sync now",
-            "description": "Ask for a sync with GitHub and Forgejo now. It runs in the \
+            "description": "Ask for a sync with GitHub now. It runs in the \
                 background; call status to see when it finished.",
             "inputSchema": {"type": "object", "additionalProperties": false},
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},

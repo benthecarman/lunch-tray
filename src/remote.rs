@@ -26,8 +26,8 @@ use lunch_tray_core::ops::Op;
 use lunch_tray_core::sync::SyncStatus;
 
 use crate::config::RemoteConfig;
+use crate::http::Ureq;
 use crate::shared::{Notice, SharedRef};
-use crate::sync::Ureq;
 
 /// With a socket, how long a read waits, so commands are not held up.
 const TICK: Duration = Duration::from_millis(250);
@@ -531,7 +531,6 @@ mod tests {
             idle_poll_secs: 1,
         };
         let (main_tx, _) = channel();
-        let (sync_tx, _) = channel();
         let (remote_tx, remote_rx) = channel();
         let shared = Arc::new(Mutex::new(Shared {
             store: Store::in_memory(),
@@ -545,7 +544,6 @@ mod tests {
             window: None,
             tray: crate::tray::TrayLink::new(),
             main_tx,
-            sync_tx,
             remote: Some(remote_tx.clone()),
         }));
         let mut link = Link::new(Client::new(&cfg).unwrap(), shared.clone());

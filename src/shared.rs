@@ -9,7 +9,6 @@ pub use lunch_tray_core::sync::SyncStatus;
 
 use crate::model::Store;
 use crate::remote::RemoteCmd;
-use crate::sync::SyncCmd;
 use crate::theme::SystemTheme;
 use crate::tray::TrayLink;
 
@@ -91,7 +90,6 @@ pub struct Shared {
     pub window: Option<std::sync::Arc<winit::window::Window>>,
     pub tray: TrayLink,
     pub main_tx: Sender<MainCmd>,
-    pub sync_tx: Sender<SyncCmd>,
     /// Set when a Worker holds the tasks: changes go there too.
     pub remote: Option<Sender<RemoteCmd>>,
 }
@@ -125,9 +123,7 @@ impl Shared {
             Some(tx) => {
                 let _ = tx.send(RemoteCmd::SyncNow);
             }
-            None => {
-                let _ = self.sync_tx.send(SyncCmd::Now);
-            }
+            None => log::warn!("no Worker set, nothing to sync"),
         }
     }
 
