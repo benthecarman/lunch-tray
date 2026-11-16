@@ -40,6 +40,9 @@ StatusNotifierItem tray icon.
   window menu.
 - Uses the desktop's Ubuntu font when installed and Phosphor icons.
 
+There is also a native iOS app for the same Worker; see
+[ios/README.md](ios/README.md).
+
 ## Build and install
 
 Lunch Tray has two parts: the Worker, which keeps the tasks, and this app,
