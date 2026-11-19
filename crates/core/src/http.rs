@@ -4,6 +4,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+#[derive(Clone)]
 pub struct Request {
     pub method: &'static str,
     pub url: String,
@@ -47,3 +48,32 @@ impl std::fmt::Display for StatusError {
 }
 
 impl std::error::Error for StatusError {}
+
+impl StatusError {
+    /// A failure on the way to the server, or of the server, that the
+    /// next attempt is likely to get past: a timeout, an overloaded or
+    /// unreachable origin, or one of the 52x statuses Cloudflare gives
+    /// when its link to the origin breaks.
+    pub fn is_transient(&self) -> bool {
+        matches!(self.0, 408 | 499 | 500 | 502..=504 | 520..=530)
+    }
+}
+
+/// The request did not get an answer at all.
+#[derive(Debug)]
+pub struct Unreachable;
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no answer")
+    }
+}
+
+/// True when `e` comes from a failure that may pass on its own: no
+/// answer, or a transient status. Bad tokens, missing items, rate limits,
+/// and answers that do not decode are not.
+pub fn is_transient(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Unreachable>().is_some()
+        || e.downcast_ref::<StatusError>()
+            .is_some_and(StatusError::is_transient)
+}

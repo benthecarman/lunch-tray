@@ -28,6 +28,9 @@ StatusNotifierItem tray icon.
   unchanged answer costs nothing; the quota headers are read on every
   answer and optional work waits when the last tenth is left; a
   rate-limit answer pauses the sync until the time GitHub gives.
+- Quiet about short outages: a request that gets no answer, a timeout, or
+  a 5xx is tried once more, and such errors show only when three passes in
+  a row fail, with one notice for the whole outage.
 - Changes show at once: the Worker pushes them to the app over a WebSocket.
   The app keeps a copy of the tasks for a start without network.
 - An MCP server on the Worker, so AI assistants can read and change the

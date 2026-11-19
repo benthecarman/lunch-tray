@@ -46,6 +46,9 @@ type Forges = Rc<Vec<Box<dyn Forge>>>;
 const BATCH_ANSWER_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Notices kept for the desktop app to pick up.
+/// Passes in a row that must fail with transient errors before the user
+/// sees them: about six minutes at the default interval.
+const TRANSIENT_PASSES: u64 = 3;
 const NOTICES_KEPT: u32 = 50;
 
 /// Bumped when the tables change shape; see `Core::new`.
@@ -773,7 +776,7 @@ impl Core {
                 f.restore_limits(l.clone());
             }
         }
-        let errors = sync_once(&forges, self, opts, round).await;
+        let failures = sync_once(&forges, self, opts, round).await;
         let limits: HashMap<String, Limits> =
             forges.iter().map(|f| (f.host(), f.limits())).collect();
         if limits != saved {
@@ -782,14 +785,30 @@ impl Core {
                 &serde_json::to_string(&limits).unwrap_or_default(),
             );
         }
+        // GitHub and Cloudflare fail a request now and then with a
+        // timeout or a 5xx that the next pass gets past. Show those only
+        // when they last.
+        let transient = !failures.is_empty() && failures.iter().all(|f| f.transient);
+        let old_streak = self.meta_u64("transient_passes").unwrap_or(0);
+        let streak = if transient { old_streak + 1 } else { 0 };
+        if streak != old_streak {
+            self.set_meta("transient_passes", &streak.to_string());
+        }
+        let errors: Vec<String> = if transient && streak < TRANSIENT_PASSES {
+            Vec::new()
+        } else {
+            failures.into_iter().map(|f| f.text).collect()
+        };
         let old = self.sync_status().unwrap_or_default().errors;
-        let changed = old != errors;
+        // One notice when a problem starts, not one for each new status
+        // code while it lasts.
+        let notify = !errors.is_empty() && old != errors && (old.is_empty() || !transient);
         self.set_sync_status(|s| {
             s.in_progress = false;
             s.last_finished = Some(Utc::now());
             s.errors = errors.clone();
         });
-        if changed {
+        if notify {
             for e in errors {
                 self.push_notice(true, e);
             }

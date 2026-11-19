@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::http::{Request, Response, StatusError, Transport};
+use crate::http::{Request, Response, StatusError, Transport, Unreachable, is_transient};
 use crate::is_excluded;
 use crate::model::{
     Checks, MergeState, OnClose, Provider, RemoteItem, RemoteKind, RemoteRef, RemoteState, Store,
@@ -22,6 +22,8 @@ const MAX_PAGES: usize = 5;
 /// Pull requests per GraphQL request. GitHub gives a query about ten
 /// seconds; bigger batches across many repositories time out with a 502.
 const GRAPHQL_BATCH: usize = 15;
+/// Tries per request when the first fails in a way that may pass.
+const ATTEMPTS: usize = 2;
 
 #[async_trait(?Send)]
 pub trait Forge {
@@ -226,16 +228,34 @@ impl Http {
         if body.is_some() {
             req_headers.push(("Content-Type".into(), "application/json".into()));
         }
-        let resp = self
-            .transport
-            .send(Request {
-                method,
-                url: url.to_string(),
-                headers: req_headers,
-                body: body.map(|b| b.to_string()),
-            })
-            .await
-            .with_context(|| format!("{method} {url}"))?;
+        let req = Request {
+            method,
+            url: url.to_string(),
+            headers: req_headers,
+            body: body.map(|b| b.to_string()),
+        };
+        // Every request here only reads, so a second try is safe. One is
+        // enough to get past most of GitHub's and Cloudflare's hiccups
+        // without using much of the Worker's subrequest budget.
+        let mut tries = 0;
+        let resp = loop {
+            tries += 1;
+            let sent = self.transport.send(req.clone()).await;
+            let transient = match &sent {
+                Ok(r) => StatusError(r.status).is_transient(),
+                Err(_) => true,
+            };
+            if transient && tries < ATTEMPTS {
+                match &sent {
+                    Ok(r) => log::info!("{method} {url}: {}, trying again", r.status),
+                    Err(e) => log::info!("{method} {url}: {e:#}, trying again"),
+                }
+                continue;
+            }
+            break sent
+                .map_err(|e| e.context(Unreachable))
+                .with_context(|| format!("{method} {url}"))?;
+        };
         let status = resp.status;
         if let Some((resource, quota)) = parse_quota(&resp) {
             log::trace!("{resource} quota: {}/{}", quota.remaining, quota.limit);
@@ -1003,8 +1023,18 @@ fn is_gone(e: &anyhow::Error) -> bool {
     )
 }
 
-/// One pass over every forge. Returns the errors, one line per forge that
-/// failed; the caller shows them and keeps the sync status.
+/// A forge whose pass failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub text: String,
+    /// The failure may pass on its own, such as a timeout or a 5xx from
+    /// GitHub or Cloudflare, so the caller can wait for the next pass
+    /// before it tells the user.
+    pub transient: bool,
+}
+
+/// One pass over every forge. Returns one failure per forge that failed;
+/// the caller shows them and keeps the sync status.
 ///
 /// `round` rotates which tracked items get an individual check when there
 /// are more than `max_individual_checks` of them.
@@ -1013,13 +1043,16 @@ pub async fn sync_once<H: SyncHost>(
     host: &H,
     opts: SyncOptions,
     round: usize,
-) -> Vec<String> {
+) -> Vec<Failure> {
     let mut errors = Vec::new();
     for forge in forges {
         if let Err(e) = sync_forge(forge.as_ref(), host, opts, round).await {
-            let msg = format!("{} {}: {e:#}", forge.provider().label(), forge.host());
-            log::warn!("{msg}");
-            errors.push(msg);
+            let text = format!("{} {}: {e:#}", forge.provider().label(), forge.host());
+            log::warn!("{text}");
+            errors.push(Failure {
+                text,
+                transient: is_transient(&e),
+            });
         }
         if opts.checks && forge.quota_low() {
             log::info!(
@@ -1510,5 +1543,52 @@ mod tests {
         assert_eq!(gh.graphql_url(), "https://api.github.com/graphql");
         gh.api_url = "https://ghe.example.com/api/v3".into();
         assert_eq!(gh.graphql_url(), "https://ghe.example.com/api/graphql");
+    }
+
+    /// Answers each request with the next status in the list, then 200.
+    struct Statuses(RefCell<Vec<u16>>);
+
+    #[async_trait(?Send)]
+    impl Transport for Statuses {
+        async fn send(&self, _: Request) -> Result<Response> {
+            let mut left = self.0.borrow_mut();
+            let status = if left.is_empty() { 200 } else { left.remove(0) };
+            Ok(Response {
+                status,
+                headers: vec![],
+                body: "{}".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_transient_status_is_tried_once_more() {
+        let http = Http::new(Box::new(Statuses(RefCell::new(vec![520]))));
+        let got = pollster::block_on(http.get_json::<serde_json::Value>("https://h/x", &[]));
+        assert!(got.is_ok(), "{got:?}");
+
+        let http = Http::new(Box::new(Statuses(RefCell::new(vec![499, 525]))));
+        let e =
+            pollster::block_on(http.get_json::<serde_json::Value>("https://h/x", &[])).unwrap_err();
+        assert!(is_transient(&e), "{e:#}");
+        assert_eq!(format!("{e:#}"), "GET https://h/x: http status 525");
+
+        let http = Http::new(Box::new(Statuses(RefCell::new(vec![404, 200]))));
+        let e =
+            pollster::block_on(http.get_json::<serde_json::Value>("https://h/x", &[])).unwrap_err();
+        assert!(!is_transient(&e) && is_gone(&e), "{e:#}");
+    }
+
+    #[test]
+    fn no_answer_is_transient_and_a_bad_token_is_not() {
+        let http = Http::new(Box::new(NoNet));
+        let e =
+            pollster::block_on(http.get_json::<serde_json::Value>("https://h/x", &[])).unwrap_err();
+        assert!(is_transient(&e), "{e:#}");
+
+        let http = Http::new(Box::new(Statuses(RefCell::new(vec![401]))));
+        let e =
+            pollster::block_on(http.get_json::<serde_json::Value>("https://h/x", &[])).unwrap_err();
+        assert!(!is_transient(&e) && is_auth_error(&e), "{e:#}");
     }
 }
