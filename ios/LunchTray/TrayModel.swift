@@ -331,7 +331,7 @@ final class TrayModel {
         if offline == nil { sync = delta.sync }
         for n in delta.notices where n.seq > noticeSeq {
             noticeSeq = n.seq
-            if !first { push(Notice(error: n.error, text: n.text)) }
+            if !first && n.isNews() { push(Notice(error: n.error, text: n.text)) }
         }
         loading = false
         saveCache()

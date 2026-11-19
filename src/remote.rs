@@ -19,6 +19,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::Utc;
 use lunch_tray_core::api::{self, Delta, Hello, OpBatch, OpResult, Push};
 use lunch_tray_core::http::{Request, Response};
 use lunch_tray_core::model::{Snapshot, Store};
@@ -447,7 +448,7 @@ impl Link {
                 continue;
             }
             self.notice_seq = n.seq;
-            if !first {
+            if !first && n.is_news(Utc::now()) {
                 s.push_notice(if n.error {
                     Notice::error(n.text)
                 } else {

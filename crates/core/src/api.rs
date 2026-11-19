@@ -15,6 +15,7 @@
 //! - `PUT /api/import` takes a [`Snapshot`] and loads it into an empty
 //!   Worker; `?replace=1` replaces what is there. `409` when not empty.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Snapshot, Task};
@@ -84,6 +85,22 @@ pub struct RemoteNotice {
     pub seq: u64,
     pub error: bool,
     pub text: String,
+    /// When the Worker made it. Missing from Workers older than this
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<DateTime<Utc>>,
+}
+
+/// How long a notice stays news. A copy that catches up after longer, such
+/// as an app that was asleep, skips older notices; the sync status still
+/// shows an error that lasts.
+pub const NOTICE_NEWS_SECS: i64 = 10 * 60;
+
+impl RemoteNotice {
+    pub fn is_news(&self, now: DateTime<Utc>) -> bool {
+        self.at
+            .is_none_or(|at| now - at < chrono::Duration::seconds(NOTICE_NEWS_SECS))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,5 +133,19 @@ mod tests {
             serde_json::to_string(&Hello { since: 3 }).unwrap(),
             r#"{"since":3}"#
         );
+    }
+
+    #[test]
+    fn only_recent_notices_are_news() {
+        let notice = |at: &str| -> RemoteNotice {
+            serde_json::from_str(&format!(r#"{{"seq":1,"error":true,"text":"x"{at}}}"#)).unwrap()
+        };
+        let now = DateTime::parse_from_rfc3339("2026-11-19T17:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(notice(r#","at":"2026-11-19T17:25:00.123Z""#).is_news(now));
+        assert!(!notice(r#","at":"2026-11-19T17:15:00Z""#).is_news(now));
+        // From a Worker that does not stamp its notices.
+        assert!(notice("").is_news(now));
     }
 }

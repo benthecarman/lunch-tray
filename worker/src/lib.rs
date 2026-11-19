@@ -23,7 +23,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use lunch_tray_core::api::{self, Hello, OpBatch, OpResult, RemoteNotice};
 use lunch_tray_core::http::{Request as HttpRequest, Response as HttpResponse, Transport};
 use lunch_tray_core::mcp::{self, Backend, Incoming};
@@ -52,7 +52,7 @@ const TRANSIENT_PASSES: u64 = 3;
 const NOTICES_KEPT: u32 = 50;
 
 /// Bumped when the tables change shape; see `Core::new`.
-const SCHEMA: u64 = 2;
+const SCHEMA: u64 = 3;
 
 #[event(start)]
 fn start() {
@@ -353,6 +353,8 @@ struct NoticeRow {
     rev: i64,
     error: i64,
     text: String,
+    /// Milliseconds since the epoch.
+    at: i64,
 }
 
 #[derive(Deserialize)]
@@ -434,6 +436,13 @@ impl Core {
                 None,
             )?;
         }
+        if from < 3 {
+            // Notices made before this have no time, and count as old.
+            sql.exec(
+                "ALTER TABLE notices ADD COLUMN at INTEGER NOT NULL DEFAULT 0",
+                None,
+            )?;
+        }
         self.set_meta("schema", &SCHEMA.to_string());
         log::info!("database schema {from} -> {SCHEMA}");
         Ok(())
@@ -466,7 +475,7 @@ impl Core {
             Vec::new()
         } else {
             sql.exec(
-                "SELECT rev, error, text FROM notices WHERE rev > ? ORDER BY rev",
+                "SELECT rev, error, text, at FROM notices WHERE rev > ? ORDER BY rev",
                 vec![int(since)],
             )?
             .to_array()?
@@ -487,6 +496,7 @@ impl Core {
                     seq: n.rev as u64,
                     error: n.error != 0,
                     text: n.text,
+                    at: DateTime::from_timestamp_millis(n.at),
                 })
                 .collect(),
         };
@@ -714,8 +724,13 @@ impl Core {
         let saved = self
             .sql
             .exec(
-                "INSERT INTO notices (rev, error, text) VALUES (?, ?, ?)",
-                vec![int(rev), i64::from(error).into(), text.into()],
+                "INSERT INTO notices (rev, error, text, at) VALUES (?, ?, ?, ?)",
+                vec![
+                    int(rev),
+                    i64::from(error).into(),
+                    text.into(),
+                    SqlStorageValue::Integer(Utc::now().timestamp_millis()),
+                ],
             )
             .and_then(|_| {
                 self.sql.exec(

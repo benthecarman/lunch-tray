@@ -48,6 +48,18 @@ private let pushJSON = """
     }
 }
 
+@Test func onlyRecentNoticesAreNews() throws {
+    let now = try #require(JSON.parseDate("2026-11-19T17:30:00Z"))
+    func notice(_ at: String) throws -> RemoteNotice {
+        try JSON.decoder.decode(
+            RemoteNotice.self, from: Data(#"{"seq":1,"error":true,"text":"x"\#(at)}"#.utf8))
+    }
+    #expect(try notice(#","at":"2026-11-19T17:25:00.123Z""#).isNews(now: now))
+    #expect(try !notice(#","at":"2026-11-19T17:15:00Z""#).isNews(now: now))
+    // From a Worker that does not stamp its notices.
+    #expect(try notice("").isNews(now: now))
+}
+
 @Test func tasksSurviveTheCache() throws {
     guard case .delta(let d) = try JSON.decoder.decode(Push.self, from: Data(pushJSON.utf8))
     else { return }

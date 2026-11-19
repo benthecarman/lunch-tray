@@ -230,6 +230,18 @@ struct RemoteNotice: Codable, Equatable, Sendable {
     var seq: UInt64
     var error: Bool
     var text: String
+    /// When the Worker made it. Missing from Workers older than this field.
+    var at: Date?
+
+    /// How long a notice stays news. See `api::NOTICE_NEWS_SECS`.
+    static let newsFor: TimeInterval = 10 * 60
+
+    /// An app that catches up after longer, such as from the background,
+    /// skips older notices; the sync status still shows an error that lasts.
+    func isNews(now: Date = .now) -> Bool {
+        guard let at else { return true }
+        return now.timeIntervalSince(at) < Self.newsFor
+    }
 }
 
 /// What changed after a revision. See `api::Delta`.
