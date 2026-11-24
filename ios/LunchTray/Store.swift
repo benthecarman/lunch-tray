@@ -237,7 +237,7 @@ struct Store: Codable, Equatable, Sendable {
             return true
         case let .settle(id):
             guard let i = index(id), tasks[i].state == .active else { return false }
-            tasks[i].state = .settled
+            tasks[i].state = tasks[i].settleState
             tasks[i].pinned = false
             tasks[i].unseen = false
             tasks[i].updatedAt = now

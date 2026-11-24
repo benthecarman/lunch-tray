@@ -173,7 +173,9 @@ Where a row shows, evaluated in order: archived, then pinned, then the state.
 | Settled | Archive | Rename, Reopen, Archive, Delete |
 | Archived | Delete | Rename, Reopen, Delete |
 
-- **Settle** drops the pin. Settling a settled task does nothing.
+- **Settle** drops the pin. Pull requests move to Settled; issues and manual
+  tasks go straight to Archived. Settling a task that is not Active does
+  nothing.
 - **Reopen** moves the task back to Active. It never restores a pin.
 - **Archive** keeps everything else as it is. Archiving an archived task does
   nothing. An archived task with an open remote item wakes on new activity.

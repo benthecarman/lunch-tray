@@ -139,7 +139,7 @@ mod tests {
         let settle = Op::Settle { id: id.clone() };
         assert!(settle.apply(&mut s).unwrap().changed);
         assert!(!settle.apply(&mut s).unwrap().changed);
-        assert_eq!(s.get(&id).unwrap().state, TaskState::Settled);
+        assert_eq!(s.get(&id).unwrap().state, TaskState::Archived);
         assert!(Op::SetPinned { id, pinned: true }.apply(&mut s).is_err());
         let empty = Op::Add {
             title: " ".into(),

@@ -52,8 +52,9 @@ on GitHub, plus tasks the user adds by hand. Each task is in one \
 section: pinned, active, settled (done for now), or archived. Remote tasks \
 come and go with sync: a new open item becomes active, a closed or merged \
 one settles, and new activity on a settled or archived item brings it back \
-to active. A task whose item is still open cannot be deleted, because the \
-next sync would bring it back; archive it instead. Task ids look like \
+to active. Settling an issue or a manual task sends it straight to archived. \
+A task whose item is still open cannot be deleted, because the next sync \
+would bring it back; archive it instead. Task ids look like \
 `github:github.com/owner/repo#123` or `manual:7`.";
 
 /// An HTTP request, reduced to what the handler looks at.
@@ -727,8 +728,9 @@ fn tool_list() -> Value {
             "name": "move_task",
             "title": "Move a task",
             "description": "Move a task to another section. \"settled\" is done for now and \
-                drops the pin; \"active\" reopens; \"archived\" puts it away. A remote task \
-                still comes back to active on new activity.",
+                drops the pin (issues and manual tasks go straight to archived); \"active\" \
+                reopens; \"archived\" puts it away. A remote task still comes back to active \
+                on new activity.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -913,7 +915,7 @@ mod tests {
         let res = call(&s, "list_tasks", json!({"section": "settled"}));
         assert_eq!(res["structuredContent"]["total"], 0);
 
-        let res = call(&s, "move_task", json!({"id": id, "to": "archived"}));
+        let res = call(&s, "move_task", json!({"id": id, "to": "settled"}));
         assert_eq!(res["structuredContent"]["task"]["section"], "archived");
         let res = call(&s, "move_task", json!({"id": id, "to": "settled"}));
         assert_eq!(res["isError"], true);

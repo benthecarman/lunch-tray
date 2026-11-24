@@ -261,6 +261,17 @@ impl Task {
             TaskState::Settled => Rung::Settled,
         }
     }
+
+    /// Where settling sends this task. Pull requests wait in Settled until
+    /// they close or wake; issues and manual tasks have no merge to wait for,
+    /// so they go straight to Archived.
+    pub fn settle_state(&self) -> TaskState {
+        match &self.origin {
+            Origin::Manual => TaskState::Archived,
+            Origin::Remote(r) if r.kind == RemoteKind::Issue => TaskState::Archived,
+            Origin::Remote(_) => TaskState::Settled,
+        }
+    }
 }
 
 /// Where a task sits. Derived, never stored.
@@ -693,7 +704,7 @@ impl Store {
         Ok(true)
     }
 
-    /// Active -> Settled. Drops the pin.
+    /// Active -> Settled, or Archived for issues and manual tasks. Drops the pin.
     pub fn settle(&mut self, id: &str) -> Result<bool, String> {
         let Some(t) = self.get_mut(id) else {
             return Ok(false);
@@ -701,7 +712,7 @@ impl Store {
         if t.state != TaskState::Active {
             return Ok(false);
         }
-        t.state = TaskState::Settled;
+        t.state = t.settle_state();
         t.pinned = false;
         t.unseen = false;
         t.updated_at = Utc::now();
@@ -836,11 +847,11 @@ impl Store {
                 }
             } else if was_open && !is_open {
                 let target = match on_close {
-                    OnClose::Settle => TaskState::Settled,
+                    OnClose::Settle => t.settle_state(),
                     OnClose::Archive => TaskState::Archived,
                 };
                 let moves = t.state == TaskState::Active
-                    || (on_close == OnClose::Archive && t.state == TaskState::Settled);
+                    || (target == TaskState::Archived && t.state == TaskState::Settled);
                 if moves {
                     t.state = target;
                     t.pinned = false;
@@ -860,7 +871,7 @@ impl Store {
             {
                 // Left your queries, for example after you submitted the
                 // review. Pinned tasks are yours to settle.
-                t.state = TaskState::Settled;
+                t.state = t.settle_state();
                 t.unseen = false;
                 changed = true;
                 events.push(SyncEvent::Released { id: key, label });
@@ -955,6 +966,14 @@ mod tests {
         }
     }
 
+    fn remote_issue(number: u64, state: RemoteState, updated: DateTime<Utc>) -> RemoteItem {
+        let mut item = remote(number, state, updated);
+        item.r.kind = RemoteKind::Issue;
+        item.r.url = format!("https://github.com/octo/cat/issues/{number}");
+        item.title = format!("Issue {number}");
+        item
+    }
+
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .unwrap()
@@ -962,22 +981,79 @@ mod tests {
     }
 
     #[test]
-    fn manual_task_walks_the_rungs() {
+    fn manual_task_settles_straight_to_archive() {
         let mut s = Store::in_memory();
         let id = s.add_manual("Buy milk", "", None);
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
         assert_eq!(s.settle(&id), Ok(true));
-        assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
-        assert_eq!(s.archive(&id), Ok(true));
         assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
+        assert_eq!(s.archive(&id), Ok(false));
         assert_eq!(s.delete(&id), Ok(true));
         assert!(s.get(&id).is_none());
     }
 
     #[test]
+    fn issue_settles_straight_to_archive_and_still_wakes() {
+        let mut s = Store::in_memory();
+        s.apply_remote(OnClose::Settle, &[remote_issue(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        s.set_pinned(&id, true).unwrap();
+        assert_eq!(s.settle(&id), Ok(true));
+        let t = s.get(&id).unwrap();
+        assert_eq!(t.rung(), Rung::Archived);
+        assert!(!t.pinned);
+        assert!(!t.unseen);
+        // Still wakes on new activity like any archived open item.
+        let ev = s.apply_remote(
+            OnClose::Settle,
+            &[remote_issue(
+                1,
+                RemoteState::Open,
+                t0() + Duration::minutes(1),
+            )],
+        );
+        assert!(matches!(ev.as_slice(), [SyncEvent::Woken { .. }]));
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
+        // Leaving queries also archives an issue instead of leaving it in Settled.
+        let mut dropped_issue = remote_issue(1, RemoteState::Open, t0() + Duration::minutes(1));
+        dropped_issue.r.in_queries = false;
+        let mut ev = Vec::new();
+        for _ in 0..QUERY_MISSES_TO_LEAVE {
+            ev = s.apply_remote(OnClose::Settle, std::slice::from_ref(&dropped_issue));
+        }
+        assert!(matches!(ev.as_slice(), [SyncEvent::Released { .. }]));
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
+    }
+
+    #[test]
+    fn closed_issue_archives_even_with_on_close_settle() {
+        let mut s = Store::in_memory();
+        s.apply_remote(OnClose::Settle, &[remote_issue(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        s.apply_remote(
+            OnClose::Settle,
+            &[remote_issue(1, RemoteState::Closed, t0())],
+        );
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
+    }
+
+    #[test]
+    fn pull_request_walks_the_rungs() {
+        let mut s = Store::in_memory();
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Active);
+        assert_eq!(s.settle(&id), Ok(true));
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Settled);
+        assert_eq!(s.archive(&id), Ok(true));
+        assert_eq!(s.get(&id).unwrap().rung(), Rung::Archived);
+    }
+
+    #[test]
     fn settling_a_settled_task_and_archiving_an_archived_task_are_noops() {
         let mut s = Store::in_memory();
-        let id = s.add_manual("x", "", None);
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        let id = s.tasks()[0].id.clone();
         assert_eq!(s.settle(&id), Ok(true));
         let before = s.get(&id).unwrap().clone();
         assert_eq!(s.settle(&id), Ok(false));
@@ -1002,14 +1078,23 @@ mod tests {
     #[test]
     fn settling_a_pinned_task_drops_the_pin() {
         let mut s = Store::in_memory();
-        let id = s.add_manual("x", "", None);
-        assert_eq!(s.set_pinned(&id, true), Ok(true));
-        assert!(s.sections().pinned.iter().any(|t| t.id == id));
-        assert_eq!(s.settle(&id), Ok(true));
-        let t = s.get(&id).unwrap();
+        s.apply_remote(OnClose::Settle, &[remote(1, RemoteState::Open, t0())]);
+        let pr = s.tasks()[0].id.clone();
+        assert_eq!(s.set_pinned(&pr, true), Ok(true));
+        assert!(s.sections().pinned.iter().any(|t| t.id == pr));
+        assert_eq!(s.settle(&pr), Ok(true));
+        let t = s.get(&pr).unwrap();
         assert!(!t.pinned);
         assert_eq!(t.rung(), Rung::Settled);
-        assert!(s.sections().settled.iter().any(|t| t.id == id));
+        assert!(s.sections().settled.iter().any(|t| t.id == pr));
+
+        let manual = s.add_manual("x", "", None);
+        assert_eq!(s.set_pinned(&manual, true), Ok(true));
+        assert_eq!(s.settle(&manual), Ok(true));
+        let t = s.get(&manual).unwrap();
+        assert!(!t.pinned);
+        assert_eq!(t.rung(), Rung::Archived);
+        assert!(s.sections().archived.iter().any(|t| t.id == manual));
     }
 
     #[test]

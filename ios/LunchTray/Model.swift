@@ -175,6 +175,16 @@ struct TrayTask: Codable, Equatable, Identifiable, Sendable {
 
     var isManual: Bool { remote == nil }
 
+    /// Pull requests wait in Settled until they close or wake; issues and
+    /// manual tasks go straight to Archived.
+    var settleState: TaskState {
+        switch origin {
+        case .manual: .archived
+        case .remote(let r) where r.kind == .issue: .archived
+        case .remote: .settled
+        }
+    }
+
     /// The remote item is open, so the store refuses to delete the task.
     var isRunning: Bool { remote?.state == .open }
 

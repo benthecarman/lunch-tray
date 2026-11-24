@@ -103,6 +103,7 @@ private let pushJSON = """
     #expect(s.task(id)?.link == nil)
     #expect(try s.apply(.setPinned(id: id, pinned: true)))
     #expect(try s.apply(.settle(id: id)))
+    #expect(s.task(id)?.state == .archived)
     #expect(s.task(id)?.pinned == false)
     #expect(try !s.apply(.settle(id: id)))
     #expect(throws: OpError.self) { try s.apply(.setPinned(id: id, pinned: true)) }
@@ -111,6 +112,29 @@ private let pushJSON = """
     #expect(s.sections().active.map(\.id) == [id])
     #expect(try s.apply(.delete(id: id)))
     #expect(s.tasks.isEmpty)
+}
+
+@Test func settlingPullRequestsAndIssuesFollowsTheCore() throws {
+    guard case .delta(let d) = try JSON.decoder.decode(Push.self, from: Data(pushJSON.utf8))
+    else { return }
+    var s = Store()
+    s.apply(delta: d)
+    let prId = "github:github.com/o/r#5"
+    #expect(try s.apply(.settle(id: prId)))
+    #expect(s.task(prId)?.state == .settled)
+    #expect(s.task(prId)?.pinned == false)
+
+    var issue = try #require(s.task(prId))
+    issue.id = "github:github.com/o/r#6"
+    issue.state = .active
+    if case .remote(var r) = issue.origin {
+        r.number = 6
+        r.kind = .issue
+        issue.origin = .remote(r)
+    }
+    s.tasks.append(issue)
+    #expect(try s.apply(.settle(id: issue.id)))
+    #expect(s.task(issue.id)?.state == .archived)
 }
 
 @Test func runningTasksCannotBeDeleted() throws {
